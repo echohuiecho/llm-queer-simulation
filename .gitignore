@@ -61,3 +61,6 @@ queer-sim-backend/data/rag_cache/
 
 # Custom RAG directories
 queer-sim-backend/data/rag/
+
+# Config files with secrets
+queer-sim-backend/config.json
