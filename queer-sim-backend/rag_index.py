@@ -225,6 +225,47 @@ class RAGIndex:
                 break
         return out
 
+    async def search_frames_by_timestamp(self, timestamp_str: str, tolerance_seconds: float = 10.0) -> List[Tuple[float, RAGSeg]]:
+        """Search for frames near a specific timestamp (e.g., "00:11:06,919" or "00:11:06")."""
+        try:
+            target_seconds = _tc_to_seconds(timestamp_str)
+        except:
+            # Try parsing without milliseconds
+            try:
+                if "," not in timestamp_str and "." not in timestamp_str:
+                    timestamp_str = timestamp_str + ",000"
+                elif "." in timestamp_str:
+                    # Convert dot to comma for milliseconds
+                    timestamp_str = timestamp_str.replace(".", ",", 1)
+                target_seconds = _tc_to_seconds(timestamp_str)
+            except Exception as e:
+                print(f"Failed to parse timestamp '{timestamp_str}': {e}")
+                return []
+
+        # Search through frame caption segments
+        matching_frames = []
+        for seg in self.segs:
+            if "captions.zh.txt" in seg.file_path or "frames" in seg.file_path:
+                # Try to extract timestamp from the segment
+                raw_text = seg.raw
+                # Match format: "时间: 00:01:23,420 (83.42秒)"
+                time_match = re.search(r'时间:\s*([\d:,\s]+)\s*\(([\d.]+)秒\)', raw_text)
+                if time_match:
+                    try:
+                        frame_seconds = float(time_match.group(2))
+                        # Check if within tolerance
+                        distance = abs(frame_seconds - target_seconds)
+                        if distance <= tolerance_seconds:
+                            # Score based on how close to target (closer = higher score)
+                            score = 1.0 / (1.0 + distance)  # Higher score for closer frames
+                            matching_frames.append((score, seg))
+                    except (ValueError, IndexError):
+                        continue
+
+        # Sort by score (closest first) and return
+        matching_frames.sort(key=lambda x: -x[0])
+        return matching_frames
+
     @staticmethod
     def render_for_prompt(hits: List[Tuple[float, RAGSeg]], max_snips: int = 4, max_chars: int = 500) -> str:
         lines = []

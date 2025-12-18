@@ -195,10 +195,37 @@ async def dispatch(agent_id: str, fn: dict):
     elif name == "retrieve_scene":
         query = args.get("query", "")
         if query:
-            # Search RAG for frames and transcript
-            hits = await rag.search(query, k=8)
-            frame_info = RAGIndex.extract_frame_info(hits)
-            transcript_hits = [(score, s) for score, s in hits if s.metadata.get("type") == "srt"]
+            # Check if query is a timestamp (e.g., "00:11:06,919" or "frame at 00:11:06,919")
+            import re
+            # Match timestamp pattern: HH:MM:SS,mmm or HH:MM:SS
+            timestamp_match = re.search(r'(\d{1,2}):(\d{2}):(\d{2})(?:[,.](\d{1,3}))?', query)
+            timestamp_str = None
+            if timestamp_match:
+                # Extract and normalize the timestamp
+                hh, mm, ss = timestamp_match.groups()[:3]
+                ms = timestamp_match.group(4) or "000"
+                # Pad milliseconds to 3 digits
+                ms = ms.ljust(3, '0')[:3]
+                timestamp_str = f"{hh.zfill(2)}:{mm}:{ss},{ms}"
+
+            # Search for frames - use timestamp search if we found a timestamp, otherwise semantic search
+            if timestamp_str:
+                # Search by timestamp first
+                timestamp_hits = await rag.search_frames_by_timestamp(timestamp_str, tolerance_seconds=10.0)
+                if timestamp_hits:
+                    # Found frames by timestamp, prioritize them but also add semantic results for context
+                    semantic_hits = await rag.search(query, k=3)
+                    all_hits = timestamp_hits + semantic_hits
+                else:
+                    # Timestamp search found nothing, fall back to semantic search
+                    print(f"No frames found at timestamp {timestamp_str}, using semantic search")
+                    all_hits = await rag.search(query, k=8)
+            else:
+                # Regular semantic search
+                all_hits = await rag.search(query, k=8)
+
+            frame_info = RAGIndex.extract_frame_info(all_hits)
+            transcript_hits = [(score, s) for score, s in all_hits if s.metadata.get("type") == "srt"]
 
             # Get the best frame if available
             best_frame = frame_info[0] if frame_info else None

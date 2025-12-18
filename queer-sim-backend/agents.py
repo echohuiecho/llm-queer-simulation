@@ -152,8 +152,10 @@ Relevant memories:
 Choose exactly ONE action by calling ONE tool:
 - send_message(text) - to say something in the current room
 - move_room(room) - to move to a different room (use one of: {', '.join(available_rooms) if available_rooms else 'group_chat, cafe, apartment'})
-- retrieve_scene(query) - to retrieve and discuss a specific scene from the video (e.g., "kiss scene", "emotional moment", "character expression at 5 minutes"). This will show the frame image and related transcript.
+- retrieve_scene(query) - to retrieve and discuss a specific scene from the video. Query can be a description (e.g., "kiss scene", "emotional moment") or a timestamp (e.g., "00:11:06,919" or "frame at 00:11:06"). This will show the frame image and related transcript.
 - wait(minutes) - to do nothing for a while
+
+IMPORTANT: You must use the tool calling mechanism - DO NOT write tool calls as text in your message. The system will execute the tool call automatically. Just call the tool, don't explain what you're doing.
 
 Guidelines:
 - Be welcoming to newcomers.
@@ -177,12 +179,97 @@ Guidelines:
             # Ollama typically returns {"function":{"name":..,"arguments":{..}}}
             return tool_calls[0]["function"]
 
-        # fallback if no tool call
+        # fallback if no tool call - check if content contains tool call syntax
         content = (msg.get("content") or "").strip()
         if content:
-            return {"name": "send_message", "arguments": {"text": content}}
+            # Try to parse tool calls from content if LLM wrote them as text
+            parsed_action = self._parse_tool_call_from_text(content)
+            if parsed_action:
+                return parsed_action
+
+            # Clean up any tool call syntax that might be in the message
+            cleaned_content = self._clean_tool_call_syntax(content)
+            if cleaned_content:
+                return {"name": "send_message", "arguments": {"text": cleaned_content}}
 
         return {"name": "wait", "arguments": {"minutes": 10}}
+
+    def _parse_tool_call_from_text(self, text: str) -> Optional[Dict[str, Any]]:
+        """Try to parse tool call syntax from text if LLM wrote it as text instead of using tool calls."""
+        import re
+        import json
+
+        # Try to match JSON format: { "action": "retrieve_scene", "query": "..." }
+        # Also handle multi-line JSON
+        json_pattern = r'\{[^{}]*"action"[^{}]*"retrieve_scene"[^{}]*"query"[^{}]*"[^"]*"[^{}]*\}'
+        json_match = re.search(json_pattern, text, re.DOTALL)
+        if json_match:
+            try:
+                json_str = json_match.group(0)
+                action_data = json.loads(json_str)
+                if action_data.get("action") == "retrieve_scene":
+                    query = action_data.get("query", "")
+                    if query:
+                        return {"name": "retrieve_scene", "arguments": {"query": query}}
+            except:
+                pass
+
+        # Try to match markdown format: **retrieve_scene(query="...")**
+        md_match = re.search(r'\*\*retrieve_scene\(query=["\']([^"\']+)["\']\)\*\*', text)
+        if md_match:
+            return {"name": "retrieve_scene", "arguments": {"query": md_match.group(1)}}
+
+        # Try to match function call format: retrieve_scene(query="...")
+        # Handle both single and double quotes, and multi-line
+        func_match = re.search(r'retrieve_scene\(query\s*=\s*["\']([^"\']+)["\']\)', text, re.DOTALL)
+        if func_match:
+            return {"name": "retrieve_scene", "arguments": {"query": func_match.group(1).strip()}}
+
+        # Try to match: retrieve_scene(query=...) without quotes
+        func_match2 = re.search(r'retrieve_scene\(query\s*=\s*([^)]+)\)', text)
+        if func_match2:
+            query = func_match2.group(1).strip().strip('"').strip("'")
+            if query:
+                return {"name": "retrieve_scene", "arguments": {"query": query}}
+
+        return None
+
+    def _clean_tool_call_syntax(self, text: str) -> str:
+        """Remove tool call syntax from message text."""
+        import re
+
+        # Remove JSON action blocks (including multi-line)
+        text = re.sub(r'\{[^{}]*"action"[^{}]*\}', '', text, flags=re.DOTALL)
+
+        # Remove markdown tool calls like **send_message(text="...")**
+        text = re.sub(r'\*\*send_message\([^)]+\)\*\*', '', text)
+        text = re.sub(r'\*\*retrieve_scene\([^)]+\)\*\*', '', text)
+
+        # Remove function call syntax (including multi-line)
+        text = re.sub(r'send_message\([^)]+\)', '', text, flags=re.DOTALL)
+        text = re.sub(r'retrieve_scene\([^)]+\)', '', text, flags=re.DOTALL)
+
+        # Remove any remaining action/function references
+        text = re.sub(r'\{"action":\s*"[^"]+"[^}]*\}', '', text, flags=re.DOTALL)
+
+        # Remove explanatory text that might follow tool calls
+        # Remove lines that look like reasoning/explanation after tool calls
+        lines = text.split('\n')
+        cleaned_lines = []
+        skip_next = False
+        for i, line in enumerate(lines):
+            # Skip lines that are clearly explanations of tool calls
+            if re.search(r'(This response|This action|stays grounded|acknowledges|aligns with)', line, re.IGNORECASE):
+                continue
+            cleaned_lines.append(line)
+
+        text = '\n'.join(cleaned_lines)
+
+        # Clean up extra whitespace
+        text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)
+        text = text.strip()
+
+        return text
 
     async def decide_dm(self, llm, recent_dms: List[Dict[str, Any]], trigger: Dict[str, Any],
                        recent_room: List[Dict[str, Any]], room_desc: str, show_snips: str = "") -> Dict[str, Any]:
@@ -225,8 +312,10 @@ Relevant memories:
 Choose exactly ONE action by calling ONE tool:
 - send_dm(to="You", text) - to reply to the user's DM
 - send_message(text) - to say something in the current room (if you want to mention something publicly)
-- retrieve_scene(query) - to retrieve and discuss a specific scene from the video (e.g., "kiss scene", "emotional moment"). This will show the frame image and related transcript.
+- retrieve_scene(query) - to retrieve and discuss a specific scene from the video. Query can be a description or a timestamp (e.g., "00:11:06,919"). This will show the frame image and related transcript.
 - wait(minutes) - to do nothing for a while
+
+IMPORTANT: You must use the tool calling mechanism - DO NOT write tool calls as text in your message. The system will execute the tool call automatically. Just call the tool, don't explain what you're doing.
 
 Guidelines:
 - This is a private conversation - be more personal and direct than in public rooms.
@@ -247,9 +336,17 @@ Guidelines:
         if tool_calls:
             return tool_calls[0]["function"]
 
-        # fallback if no tool call
+        # fallback if no tool call - check if content contains tool call syntax
         content = (msg.get("content") or "").strip()
         if content:
-            return {"name": "send_dm", "arguments": {"to": "You", "text": content}}
+            # Try to parse tool calls from content if LLM wrote them as text
+            parsed_action = self._parse_tool_call_from_text(content)
+            if parsed_action:
+                return parsed_action
+
+            # Clean up any tool call syntax that might be in the message
+            cleaned_content = self._clean_tool_call_syntax(content)
+            if cleaned_content:
+                return {"name": "send_dm", "arguments": {"to": "You", "text": cleaned_content}}
 
         return {"name": "wait", "arguments": {"minutes": 10}}
