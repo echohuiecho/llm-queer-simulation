@@ -5,10 +5,12 @@ import Link from "next/link";
 
 type RoomId = "apartment" | "cafe" | "group_chat";
 
-type Msg = { type: "message"; room: string; from: string; text: string; ts: number };
+type Msg = { type: "message"; room: string; from: string; text: string; ts: number; frameReference?: FrameReference };
 type PresenceEvent = { type: "presence"; agent: string; room: string; pos: { x: number; y: number }; ts: number };
 type SystemMsg = { type: "system_message"; room: string; text: string; ts: number };
 type AgentStateMsg = { type: "agent_state"; id: string; name: string; room: RoomId; pos: { x: number; y: number }; ts: number };
+type FrameReferenceMsg = { type: "frame_reference"; agent: string; frame_file: string; timestamp: string; timestamp_seconds: number; caption: string; room: string; ts: number };
+type FrameReference = { frame_file: string; timestamp: string; timestamp_seconds: number; caption: string };
 
 type StateMsg = {
   type: "state";
@@ -295,6 +297,34 @@ export default function Home() {
       if (data.type === "agent_state") {
         const s = data as AgentStateMsg;
         setAgents((prev) => prev.map((a) => (a.id === s.id ? { ...a, pos: s.pos, room: s.room } : a)));
+        return;
+      }
+
+      if (data.type === "frame_reference") {
+        const f = data as FrameReferenceMsg;
+        // Find the most recent message from this agent in this room and attach frame reference
+        setMessages((prev) => {
+          const roomMsgs = prev[f.room] ?? [];
+          const updatedMsgs = [...roomMsgs];
+          // Find the last message from this agent
+          for (let i = updatedMsgs.length - 1; i >= 0; i--) {
+            const msg = updatedMsgs[i];
+            if (msg.type === "message" && msg.from === f.agent) {
+              updatedMsgs[i] = {
+                ...msg,
+                frameReference: {
+                  frame_file: f.frame_file,
+                  timestamp: f.timestamp,
+                  timestamp_seconds: f.timestamp_seconds,
+                  caption: f.caption
+                }
+              };
+              break;
+            }
+          }
+          return { ...prev, [f.room]: updatedMsgs };
+        });
+        return;
       }
     };
 
@@ -417,6 +447,26 @@ export default function Home() {
                     color: isUser ? "white" : "rgba(255,255,255,0.9)"
                   }}>
                     {m.text}
+                    {m.frameReference && (
+                      <div style={{ marginTop: 12, padding: 12, background: "rgba(0,0,0,0.3)", borderRadius: 8, border: "1px solid rgba(255,255,255,0.1)" }}>
+                        <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 8 }}>画面 {m.frameReference.timestamp}</div>
+                        <img
+                          src={`http://localhost:8000/api/rag/frame?path=${encodeURIComponent(m.frameReference.frame_file)}`}
+                          alt={m.frameReference.caption}
+                          style={{
+                            width: "100%",
+                            maxWidth: 400,
+                            borderRadius: 8,
+                            marginBottom: 8,
+                            border: "1px solid rgba(255,255,255,0.1)"
+                          }}
+                          onError={(e) => {
+                            (e.target as HTMLImageElement).style.display = "none";
+                          }}
+                        />
+                        <div style={{ fontSize: 13, opacity: 0.8, fontStyle: "italic" }}>{m.frameReference.caption}</div>
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>

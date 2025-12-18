@@ -33,11 +33,65 @@ export default function SettingsPage() {
   const [ragDirs, setRagDirs] = useState<string[]>([]);
   const [newDirName, setNewDirName] = useState("");
   const [startConversationStatus, setStartConversationStatus] = useState<string | null>(null);
+  const [youtubeUrls, setYoutubeUrls] = useState("");
+  const [youtubeJobId, setYoutubeJobId] = useState<string | null>(null);
+  const [youtubeJobStatus, setYoutubeJobStatus] = useState<any>(null);
 
   useEffect(() => {
     fetchSettings();
     fetchRagDirs();
   }, []);
+
+  useEffect(() => {
+    let interval: any;
+    if (youtubeJobId) {
+      interval = setInterval(fetchYoutubeJobStatus, 2000);
+    }
+    return () => clearInterval(interval);
+  }, [youtubeJobId]);
+
+  const fetchYoutubeJobStatus = async () => {
+    if (!youtubeJobId) return;
+    try {
+      const response = await fetch(`http://localhost:8000/api/rag/youtube/jobs/${youtubeJobId}`);
+      const data = await response.json();
+      setYoutubeJobStatus(data);
+      if (data.status === "completed" || data.status === "failed") {
+        setYoutubeJobId(null);
+        if (data.status === "completed") {
+          fetchRagDirs(); // Refresh list just in case
+        }
+      }
+    } catch (error) {
+      console.error("Failed to fetch YouTube job status:", error);
+    }
+  };
+
+  const handleYoutubeIngest = async () => {
+    if (!youtubeUrls.trim() || !settings?.rag_directory) return;
+    const urls = youtubeUrls.split("\n").map(u => u.trim()).filter(u => u);
+    if (urls.length === 0) return;
+
+    setYoutubeJobStatus({ status: "pending", progress: 0 });
+    try {
+      const response = await fetch("http://localhost:8000/api/rag/youtube/ingest", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          dir_name: settings.rag_directory,
+          urls: urls
+        }),
+      });
+      const data = await response.json();
+      if (data.job_id) {
+        setYoutubeJobId(data.job_id);
+      } else {
+        setYoutubeJobStatus({ status: "failed", errors: [data.error || "Failed to start job"] });
+      }
+    } catch (error) {
+      setYoutubeJobStatus({ status: "failed", errors: ["Network error starting job"] });
+    }
+  };
 
   const fetchSettings = async () => {
     try {
@@ -379,6 +433,62 @@ export default function SettingsPage() {
                   // Maybe show a temporary success message
                 }}
               />
+            </div>
+
+            <div style={{ marginTop: 32, paddingTop: 32, borderTop: "1px solid rgba(255,255,255,0.05)" }}>
+              <h3 style={{ fontSize: 16, fontWeight: 600, marginBottom: 16 }}>YouTube Ingestion</h3>
+              <p style={{ fontSize: 13, opacity: 0.7, marginBottom: 16 }}>
+                Enter YouTube URLs (one per line) to download video, transcript, and extract frames as RAG context.
+              </p>
+              <textarea
+                value={youtubeUrls}
+                onChange={(e) => setYoutubeUrls(e.target.value)}
+                placeholder="https://www.youtube.com/watch?v=..."
+                rows={3}
+                style={{ width: "100%", padding: 12, background: "rgba(0,0,0,0.3)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 8, color: "white", fontSize: 13, marginBottom: 12 }}
+                disabled={!!youtubeJobId}
+              />
+              <button
+                onClick={handleYoutubeIngest}
+                disabled={!!youtubeJobId || !youtubeUrls.trim()}
+                style={{
+                  padding: "10px 24px",
+                  background: youtubeJobId || !youtubeUrls.trim() ? "rgba(74, 158, 255, 0.5)" : "#4a9eff",
+                  color: "white",
+                  border: "none",
+                  borderRadius: 8,
+                  cursor: youtubeJobId || !youtubeUrls.trim() ? "not-allowed" : "pointer",
+                  fontWeight: 600,
+                  fontSize: 14
+                }}
+              >
+                {youtubeJobId ? "Ingesting..." : "Start Ingestion"}
+              </button>
+
+              {youtubeJobStatus && (
+                <div style={{ marginTop: 20, padding: 16, borderRadius: 12, background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.05)" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
+                    <span style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase" }}>Status: {youtubeJobStatus.status}</span>
+                    <span style={{ fontSize: 12 }}>{Math.round(youtubeJobStatus.progress)}%</span>
+                  </div>
+                  <div style={{ width: "100%", height: 4, background: "rgba(255,255,255,0.1)", borderRadius: 2, overflow: "hidden" }}>
+                    <div style={{ width: `${youtubeJobStatus.progress}%`, height: "100%", background: "#4a9eff", transition: "width 0.3s ease" }} />
+                  </div>
+                  {youtubeJobStatus.current_url && (
+                    <div style={{ marginTop: 8, fontSize: 11, opacity: 0.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      Processing: {youtubeJobStatus.current_url}
+                    </div>
+                  )}
+                  {youtubeJobStatus.errors && youtubeJobStatus.errors.length > 0 && (
+                    <div style={{ marginTop: 12 }}>
+                      <div style={{ fontSize: 11, color: "#ff4a4a", fontWeight: 600, marginBottom: 4 }}>Errors:</div>
+                      {youtubeJobStatus.errors.map((err: string, i: number) => (
+                        <div key={i} style={{ fontSize: 11, color: "#ff4a4a", marginBottom: 2 }}>• {err}</div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           </div>
         </section>

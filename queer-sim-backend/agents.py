@@ -59,6 +59,23 @@ TOOLS: List[Dict[str, Any]] = [
       }
     }
   },
+  {
+    "type": "function",
+    "function": {
+      "name": "retrieve_scene",
+      "description": "Retrieve and discuss a specific scene from the video by searching for frames and transcript context. Use this when you want to reference visual content or discuss what happens at a specific moment in the show.",
+      "parameters": {
+        "type": "object",
+        "required": ["query"],
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Description of the scene or moment you want to retrieve (e.g., 'kiss scene', 'emotional moment at 5 minutes', 'character expression')"
+          }
+        }
+      }
+    }
+  },
 ]
 
 @dataclass
@@ -135,6 +152,7 @@ Relevant memories:
 Choose exactly ONE action by calling ONE tool:
 - send_message(text) - to say something in the current room
 - move_room(room) - to move to a different room (use one of: {', '.join(available_rooms) if available_rooms else 'group_chat, cafe, apartment'})
+- retrieve_scene(query) - to retrieve and discuss a specific scene from the video (e.g., "kiss scene", "emotional moment", "character expression at 5 minutes"). This will show the frame image and related transcript.
 - wait(minutes) - to do nothing for a while
 
 Guidelines:
@@ -144,6 +162,7 @@ Guidelines:
 - You can move rooms naturally - maybe you want a quieter space, want to check another room, need a break, or want to see what's happening elsewhere.
 - Don't stay in the same room all the time - variety makes the simulation interesting.
 - If the current room has been quiet or you've been there a while, consider moving to another room.
+- When discussing visual moments, scenes, character expressions, or specific moments in the show, use retrieve_scene() to show the actual frame and discuss it with transcript context. This makes conversations more engaging and specific.
 """
 
         resp = await llm.chat(
@@ -206,6 +225,7 @@ Relevant memories:
 Choose exactly ONE action by calling ONE tool:
 - send_dm(to="You", text) - to reply to the user's DM
 - send_message(text) - to say something in the current room (if you want to mention something publicly)
+- retrieve_scene(query) - to retrieve and discuss a specific scene from the video (e.g., "kiss scene", "emotional moment"). This will show the frame image and related transcript.
 - wait(minutes) - to do nothing for a while
 
 Guidelines:
@@ -213,6 +233,7 @@ Guidelines:
 - Keep it conversational and not too long.
 - You can reference what's happening in rooms if relevant, but focus on the private conversation.
 - Be genuine and authentic to your persona.
+- When discussing visual moments or scenes from the show, you can use retrieve_scene() to show frames and discuss them with transcript context.
 """
 
         resp = await llm.chat(

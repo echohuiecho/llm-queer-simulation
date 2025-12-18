@@ -2,6 +2,14 @@ import os
 import json
 from typing import Dict, List, Any, Optional
 
+# Load .env file if it exists
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    # python-dotenv not installed, skip .env loading
+    pass
+
 class Config:
     def __init__(self, config_path: str = "config.json"):
         self.config_path = config_path
@@ -95,7 +103,12 @@ Can accidentally bring "TikTok discourse energy" into a calm space"""
                 {"sender": "Noor K.", "text": "same. also Tina's micro-expressions in the quiet scenes… unreal."},
                 {"sender": "Ji-woo", "text": "can we do a quick CW note? ep2 has overdose/addiction + coercion vibes."}
             ],
-            "rag_directory": "default"
+            "rag_directory": "default",
+            "openai_api_key": os.getenv("OPENAI_API_KEY", ""),
+            "openai_base_url": os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+            "openai_translate_model": os.getenv("OPENAI_TRANSLATE_MODEL", "gpt-4o"),
+            "openai_vision_model": os.getenv("OPENAI_VISION_MODEL", "gpt-4o"),
+            "youtube_frame_scene_threshold": 0.3
         }
         self.data = self.load()
 
@@ -106,6 +119,19 @@ Can accidentally bring "TikTok discourse energy" into a calm space"""
                     user_config = json.load(f)
                     config = self.defaults.copy()
                     config.update(user_config)
+
+                    # Override empty string values with environment variables if available
+                    # This allows .env file to work even if config.json has empty strings
+                    env_overrides = {
+                        "openai_api_key": os.getenv("OPENAI_API_KEY"),
+                        "openai_base_url": os.getenv("OPENAI_BASE_URL"),
+                        "openai_translate_model": os.getenv("OPENAI_TRANSLATE_MODEL"),
+                        "openai_vision_model": os.getenv("OPENAI_VISION_MODEL"),
+                    }
+                    for key, env_value in env_overrides.items():
+                        if env_value and (not config.get(key) or config.get(key) == ""):
+                            config[key] = env_value
+
                     return config
             except Exception as e:
                 print(f"Error loading config: {e}")

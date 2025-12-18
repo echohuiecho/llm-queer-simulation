@@ -36,5 +36,10 @@
       "text": "can we do a quick CW note? ep2 has overdose/addiction + coercion vibes."
     }
   ],
-  "rag_directory": "default"
+  "rag_directory": "default",
+  "openai_api_key": "YOUR_OPENAI_API_KEY",
+  "openai_base_url": "https://api.openai.com/v1",
+  "openai_translate_model": "gpt-4o",
+  "openai_vision_model": "gpt-4o",
+  "youtube_frame_scene_threshold": 0.3
 }

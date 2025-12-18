@@ -3,3 +3,9 @@ uvicorn
 httpx
 numpy
 python-multipart
+yt-dlp
+faster-whisper
+openai
+langdetect
+ffmpeg-python
+python-dotenv

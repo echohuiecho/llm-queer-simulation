@@ -240,3 +240,35 @@ class RAGIndex:
                 lines.append(f'- "{txt}" (File: {os.path.basename(s.file_path)})')
 
         return "\n".join(lines) if lines else "(no relevant knowledge base lines found)"
+
+    @staticmethod
+    def extract_frame_info(hits: List[Tuple[float, RAGSeg]]) -> List[Dict[str, Any]]:
+        """Extract frame information from RAG hits that contain frame captions."""
+        frames = []
+        for score, s in hits:
+            # Check if this is a frame caption (from captions.zh.txt)
+            file_path = s.file_path
+            if "captions.zh.txt" in file_path or "frames" in file_path:
+                # Parse the caption format: "时间: 00:00:01,760 (1.76秒) 帧文件: frames/000001.jpg"
+                raw_text = s.raw.strip()
+                import re
+                # Extract timestamp and frame file
+                time_match = re.search(r'时间:\s*([\d:,\s]+)\s*\(([\d.]+)秒\)', raw_text)
+                frame_match = re.search(r'帧文件:\s*(frames/[^\s\n]+)', raw_text)
+                if time_match and frame_match:
+                    tc = time_match.group(1).strip()
+                    ts_s = float(time_match.group(2))
+                    frame_file = frame_match.group(1)
+                    # Extract caption description
+                    caption_match = re.search(r'画面描述:\s*(.+?)(?=\n\n|\n时间:|$)', raw_text, re.DOTALL)
+                    caption = caption_match.group(1).strip() if caption_match else ""
+
+                    frames.append({
+                        "score": float(score),
+                        "timestamp": tc,
+                        "timestamp_seconds": ts_s,
+                        "frame_file": frame_file,
+                        "caption": caption,
+                        "full_path": file_path
+                    })
+        return frames

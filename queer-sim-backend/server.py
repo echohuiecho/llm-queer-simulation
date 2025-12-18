@@ -13,6 +13,7 @@ from agents import Agent, AgentProfile
 from memory import MemoryStore
 from rag_index import RAGIndex
 from config import config
+from youtube_ingest import YouTubeIngestManager
 
 app = FastAPI()
 app.add_middleware(
@@ -38,6 +39,9 @@ world = World(
 
 # Generalized RAG index
 rag = RAGIndex(llm.embed)
+
+# YouTube Ingest Manager
+youtube_ingest = YouTubeIngestManager(config, rag)
 
 async def broadcast(event):
     dead = []
@@ -96,10 +100,18 @@ async def run_dm_reaction(agent_name: str, trigger_msg):
     recent_room = world.recent(room, n=10)
     desc = world.room_desc.get(room, "")
 
-    # Search show subtitles
+    # Search show subtitles and frames
     query = f'You: {trigger_msg["text"]}\n' + "\n".join([m.get("text", "") for m in recent_dms[-5:]])
-    hits = await rag.search(query, k=3)
+    hits = await rag.search(query, k=5)
     show_snips = RAGIndex.render_for_prompt(hits)
+
+    # Extract frame info for context
+    frame_info = RAGIndex.extract_frame_info(hits)
+    if frame_info:
+        frame_context = f"\n\nAvailable video frames matching this context:\n"
+        for i, frame in enumerate(frame_info[:2]):
+            frame_context += f"- {frame['timestamp']}: {frame['caption'][:100]}...\n"
+        show_snips += frame_context
 
     # Create a DM-specific decision context
     # The agent should respond in a more personal, direct way
@@ -115,10 +127,18 @@ async def run_reactions(trigger_msg):
     desc = world.room_desc.get(room, "")
     available_rooms = list(world.rooms.keys())
 
-    # Search show subtitles for relevant lines
+    # Search show subtitles and frames for relevant lines
     query = f'{trigger_msg["from"]}: {trigger_msg["text"]}\n' + "\n".join([m["text"] for m in recent[-8:]])
-    hits = await rag.search(query, k=4)
+    hits = await rag.search(query, k=6)  # Get more hits to include both transcript and frames
     show_snips = RAGIndex.render_for_prompt(hits)
+
+    # Extract frame info for context (agents can see what frames are available)
+    frame_info = RAGIndex.extract_frame_info(hits)
+    if frame_info:
+        frame_context = f"\n\nAvailable video frames matching this context:\n"
+        for i, frame in enumerate(frame_info[:3]):  # Show top 3 frames
+            frame_context += f"- {frame['timestamp']}: {frame['caption'][:100]}...\n"
+        show_snips += frame_context
 
     tasks = []
     agent_list = []
@@ -172,6 +192,123 @@ async def dispatch(agent_id: str, fn: dict):
         if room in world.rooms:
             await world.move_agent(agent_id, room)
 
+    elif name == "retrieve_scene":
+        query = args.get("query", "")
+        if query:
+            # Search RAG for frames and transcript
+            hits = await rag.search(query, k=8)
+            frame_info = RAGIndex.extract_frame_info(hits)
+            transcript_hits = [(score, s) for score, s in hits if s.metadata.get("type") == "srt"]
+
+            # Get the best frame if available
+            best_frame = frame_info[0] if frame_info else None
+
+            # Get nearby transcript context
+            transcript_context = RAGIndex.render_for_prompt(transcript_hits[:3], max_snips=3, max_chars=300)
+
+            # Get recent chat context for the room
+            recent = world.recent(a.room, n=10)
+            recent_text = "\n".join([f'{m["from"]}: {m["text"]}' for m in recent[-8:]])
+
+            # Get agent persona
+            agent_profile = config.get("agent_profiles", {}).get(a.profile.agent_id, {})
+            persona = agent_profile.get("persona", "")
+
+            # Generate LLM response about the scene
+            if best_frame:
+                system = config.get("system_prompt")
+                user_prompt = f"""You are {a.profile.name}.
+
+Persona:
+{persona}
+
+Recent chat in #{a.room}:
+{recent_text}
+
+You just retrieved a scene from the video. Here's what you found:
+
+Frame at {best_frame['timestamp']}:
+{best_frame['caption']}
+
+Transcript context:
+{transcript_context if transcript_context != "(no relevant knowledge base lines found)" else "No specific transcript lines found for this moment."}
+
+Generate a natural, conversational response about this scene. You should:
+- React to the visual content in the frame
+- Connect it to the recent conversation if relevant
+- Reference the transcript if it adds context
+- Be authentic to your persona
+- Keep it conversational (2-4 sentences)
+- Mention the timestamp naturally (e.g., "at {best_frame['timestamp']}" or "around {best_frame['timestamp']}")
+
+Write your response as if you're sharing this scene with the group:"""
+
+                try:
+                    resp = await llm.chat(
+                        messages=[
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": user_prompt}
+                        ]
+                    )
+                    frame_msg = (resp.get("message", {}).get("content") or "").strip()
+                    if not frame_msg:
+                        # Fallback if LLM doesn't return content
+                        frame_msg = f"看看这个画面 ({best_frame['timestamp']}): {best_frame['caption']}"
+                except Exception as e:
+                    print(f"Error generating scene response for {a.profile.name}: {e}")
+                    # Fallback message
+                    frame_msg = f"看看这个画面 ({best_frame['timestamp']}): {best_frame['caption']}"
+
+                # Send message with frame reference
+                await world.post_message(a.room, a.profile.name, frame_msg)
+
+                # Broadcast frame info for frontend to display
+                await broadcast({
+                    "type": "frame_reference",
+                    "agent": a.profile.name,
+                    "frame_file": best_frame["frame_file"],
+                    "timestamp": best_frame["timestamp"],
+                    "timestamp_seconds": best_frame["timestamp_seconds"],
+                    "caption": best_frame["caption"],
+                    "room": a.room,
+                    "ts": time.time()
+                })
+            else:
+                # No frame found, but might have transcript - generate response about transcript
+                if transcript_context and transcript_context != "(no relevant knowledge base lines found)":
+                    system = config.get("system_prompt")
+                    user_prompt = f"""You are {a.profile.name}.
+
+Persona:
+{persona}
+
+Recent chat in #{a.room}:
+{recent_text}
+
+You searched for "{query}" but couldn't find a specific frame. However, you found these transcript lines:
+
+{transcript_context}
+
+Generate a natural response about these transcript lines, connecting them to the conversation if relevant. Keep it conversational (1-3 sentences)."""
+
+                    try:
+                        resp = await llm.chat(
+                            messages=[
+                                {"role": "system", "content": system},
+                                {"role": "user", "content": user_prompt}
+                            ]
+                        )
+                        transcript_msg = (resp.get("message", {}).get("content") or "").strip()
+                        if not transcript_msg:
+                            transcript_msg = f"关于「{query}」:\n{transcript_context}"
+                    except Exception as e:
+                        print(f"Error generating transcript response for {a.profile.name}: {e}")
+                        transcript_msg = f"关于「{query}」:\n{transcript_context}"
+
+                    await world.post_message(a.room, a.profile.name, transcript_msg)
+                else:
+                    await world.post_message(a.room, a.profile.name, f"没找到关于「{query}」的画面或台词。")
+
     elif name == "wait":
         return
 
@@ -194,10 +331,18 @@ async def proactive_loop():
         desc = world.room_desc.get(room, "")
         available_rooms = list(world.rooms.keys())
 
-        # Search show subtitles for proactive moments (use recent chat context)
+        # Search show subtitles and frames for proactive moments (use recent chat context)
         query = "\n".join([m["text"] for m in recent[-8:]]) if recent else "show discussion"
-        hits = await rag.search(query, k=4)
+        hits = await rag.search(query, k=6)  # Get more hits to include both transcript and frames
         show_snips = RAGIndex.render_for_prompt(hits)
+
+        # Extract frame info for context
+        frame_info = RAGIndex.extract_frame_info(hits)
+        if frame_info:
+            frame_context = f"\n\nAvailable video frames matching this context:\n"
+            for i, frame in enumerate(frame_info[:3]):
+                frame_context += f"- {frame['timestamp']}: {frame['caption'][:100]}...\n"
+            show_snips += frame_context
 
         # Trigger with "nothing happened, what do you do?"
         trigger = {
@@ -313,6 +458,27 @@ async def create_rag_dir(data: dict):
     return {"status": "ok", "path": path}
 
 from fastapi import UploadFile, File
+from fastapi.responses import FileResponse
+
+@app.get("/api/rag/frame")
+async def get_frame(path: str = Query(...)):
+    """Serve frame images from RAG directories."""
+    # Path format from index: "frames/000001.jpg"
+    # Actual location: "data/rag/<kb>/youtube/<video_id>/frames/000001.jpg"
+    rag_dir_name = config.get("rag_directory", "default")
+    rag_path = os.path.join("data/rag", rag_dir_name)
+
+    # Extract just the filename
+    frame_filename = path.split("/")[-1] if "/" in path else path
+
+    # Search recursively in the RAG directory for this frame
+    for root, dirs, files in os.walk(rag_path):
+        if frame_filename in files:
+            frame_path = os.path.join(root, frame_filename)
+            if os.path.exists(frame_path) and frame_path.endswith(('.jpg', '.jpeg', '.png')):
+                return FileResponse(frame_path, media_type="image/jpeg")
+
+    return {"error": "Frame not found"}, 404
 
 @app.post("/api/rag/upload")
 async def upload_rag_file(dir_name: str = Query(...), file: UploadFile = File(...)):
@@ -342,6 +508,30 @@ async def select_rag_dir(data: dict):
     config.set("rag_directory", name)
     await rag.load_directory(target_dir)
     return {"status": "ok", "current": name}
+
+@app.post("/api/rag/youtube/ingest")
+async def ingest_youtube(data: dict):
+    dir_name = data.get("dir_name")
+    urls = data.get("urls")
+    if not dir_name or not urls:
+        return {"error": "dir_name and urls required"}, 400
+
+    job_id = await youtube_ingest.create_job(dir_name, urls)
+    return {"status": "ok", "job_id": job_id}
+
+@app.get("/api/rag/youtube/jobs/{job_id}")
+async def get_youtube_job(job_id: str):
+    job = youtube_ingest.jobs.get(job_id)
+    if not job:
+        return {"error": "job not found"}, 404
+    return {
+        "job_id": job.job_id,
+        "status": job.status,
+        "progress": job.progress,
+        "current_url": job.current_url,
+        "errors": job.errors,
+        "results": job.results
+    }
 
 @app.post("/api/rag/start-conversation")
 async def start_conversation_with_kb(data: dict):

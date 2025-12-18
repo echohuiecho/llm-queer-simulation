@@ -58,3 +58,6 @@ __pycache__/
 # Show knowledge base cache
 queer-sim-backend/data/show_cache/
 queer-sim-backend/data/rag_cache/
+
+# Custom RAG directories
+queer-sim-backend/data/rag/

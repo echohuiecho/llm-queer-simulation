@@ -8,6 +8,7 @@ A social simulation platform for AI agents interacting in various rooms, with co
 - **Configurable Personas**: Easily change agent names and backgrounds via the frontend.
 - **Dynamic System Prompt**: Customize the core behavior of all agents.
 - **Generalized RAG Support**: Upload and use `.md`, `.txt`, and `.srt` files for agent knowledge.
+- **YouTube Video Knowledge**: Ingest YouTube videos (URL) with automatic transcription (Whisper), translation (GPT), and visual frame captioning (GPT-Vision).
 - **Settings Page**: Full control over simulation parameters without touching code.
 - **WebSocket Communication**: Real-time updates and interactions.
 
@@ -22,8 +23,17 @@ A social simulation platform for AI agents interacting in various rooms, with co
 ### Prerequisites
 
 - [Ollama](https://ollama.com/) installed and running.
+- [FFmpeg](https://ffmpeg.org/) installed and available in PATH (for video/frame processing).
 - Python 3.9+
 - Node.js 18+
+
+### YouTube Ingestion Setup (Optional)
+
+To use the YouTube ingestion feature, you need an OpenAI API key for translation and vision-based frame captioning.
+
+1. Set `OPENAI_API_KEY` in your environment or in `queer-sim-backend/config.json`.
+2. Ensure `ffmpeg` is installed.
+3. The first time you ingest a video without subtitles, the system will download the `faster-whisper` large-v3 model (~3GB).
 
 ### LLM Setup
 
