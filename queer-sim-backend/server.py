@@ -343,6 +343,26 @@ async def select_rag_dir(data: dict):
     await rag.load_directory(target_dir)
     return {"status": "ok", "current": name}
 
+@app.post("/api/rag/start-conversation")
+async def start_conversation_with_kb(data: dict):
+    """Select a knowledge base and kick start a conversation with it."""
+    name = data.get("name")
+    if not name:
+        return {"error": "name required"}, 400
+
+    target_dir = os.path.join("data/rag", name)
+    if not os.path.exists(target_dir):
+        return {"error": "directory not found"}, 404
+
+    # Select and load the RAG directory
+    config.set("rag_directory", name)
+    await rag.load_directory(target_dir)
+
+    # Seed the initial chat
+    await seed_initial_chat()
+
+    return {"status": "ok", "current": name, "message": "Conversation started with knowledge base"}
+
 # ---------- Startup ----------
 
 @app.on_event("startup")

@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import FileUpload from "../../components/FileUpload";
 
 interface AgentProfile {
@@ -25,11 +26,13 @@ interface Settings {
 }
 
 export default function SettingsPage() {
+  const router = useRouter();
   const [settings, setSettings] = useState<Settings | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [saveStatus, setSaveStatus] = useState<string | null>(null);
   const [ragDirs, setRagDirs] = useState<string[]>([]);
   const [newDirName, setNewDirName] = useState("");
+  const [startConversationStatus, setStartConversationStatus] = useState<string | null>(null);
 
   useEffect(() => {
     fetchSettings();
@@ -155,6 +158,40 @@ export default function SettingsPage() {
     }
   };
 
+  const startConversationWithKb = async (name?: string) => {
+    const kbName = name || settings?.rag_directory;
+    if (!kbName) {
+      setStartConversationStatus("Please select a knowledge base first");
+      setTimeout(() => setStartConversationStatus(null), 3000);
+      return;
+    }
+
+    setStartConversationStatus("Starting conversation...");
+    try {
+      const response = await fetch("http://localhost:8000/api/rag/start-conversation", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: kbName }),
+      });
+      if (response.ok) {
+        setStartConversationStatus("Conversation started! Redirecting...");
+        // Update settings to reflect the selected KB
+        setSettings(prev => prev ? { ...prev, rag_directory: kbName } : null);
+        // Navigate back to main page after a short delay
+        setTimeout(() => {
+          router.push("/");
+        }, 1500);
+      } else {
+        const error = await response.json();
+        setStartConversationStatus(`Failed: ${error.error || "Unknown error"}`);
+        setTimeout(() => setStartConversationStatus(null), 3000);
+      }
+    } catch (error) {
+      setStartConversationStatus("Error starting conversation");
+      setTimeout(() => setStartConversationStatus(null), 3000);
+    }
+  };
+
   if (isLoading) return <div style={{ padding: 40, color: "white" }}>Loading...</div>;
   if (!settings) return <div style={{ padding: 40, color: "white" }}>Error loading settings</div>;
 
@@ -273,15 +310,46 @@ export default function SettingsPage() {
           <div style={{ padding: 24, borderRadius: 16, background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.05)" }}>
             <div style={{ marginBottom: 24 }}>
               <label style={{ display: "block", fontSize: 12, opacity: 0.5, marginBottom: 8 }}>Select Directory</label>
-              <select
-                value={settings.rag_directory}
-                onChange={(e) => selectRagDir(e.target.value)}
-                style={{ width: "100%", padding: 10, background: "#111", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 8, color: "white" }}
-              >
-                {ragDirs.map(dir => (
-                  <option key={dir} value={dir}>{dir}</option>
-                ))}
-              </select>
+              <div style={{ display: "flex", gap: 12, alignItems: "flex-end" }}>
+                <div style={{ flex: 1 }}>
+                  <select
+                    value={settings.rag_directory}
+                    onChange={(e) => selectRagDir(e.target.value)}
+                    style={{ width: "100%", padding: 10, background: "#111", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 8, color: "white" }}
+                  >
+                    {ragDirs.map(dir => (
+                      <option key={dir} value={dir}>{dir}</option>
+                    ))}
+                  </select>
+                </div>
+                <button
+                  onClick={() => startConversationWithKb()}
+                  disabled={!!startConversationStatus}
+                  style={{
+                    padding: "10px 20px",
+                    background: startConversationStatus ? "rgba(74, 158, 255, 0.5)" : "#4a9eff",
+                    color: "white",
+                    border: "none",
+                    borderRadius: 8,
+                    cursor: startConversationStatus ? "not-allowed" : "pointer",
+                    fontWeight: 600,
+                    fontSize: 14,
+                    whiteSpace: "nowrap"
+                  }}
+                >
+                  {startConversationStatus || "Start Conversation"}
+                </button>
+              </div>
+              {startConversationStatus && startConversationStatus !== "Starting conversation..." && startConversationStatus !== "Conversation started! Redirecting..." && (
+                <div style={{ marginTop: 8, fontSize: 12, color: "#ff4a4a" }}>
+                  {startConversationStatus}
+                </div>
+              )}
+              {startConversationStatus === "Conversation started! Redirecting..." && (
+                <div style={{ marginTop: 8, fontSize: 12, color: "#4a9eff" }}>
+                  {startConversationStatus}
+                </div>
+              )}
             </div>
 
             <div style={{ marginBottom: 24 }}>
