@@ -225,13 +225,53 @@ async def dispatch(agent_id: str, fn: dict):
                 all_hits = await rag.search(query, k=8)
 
             frame_info = RAGIndex.extract_frame_info(all_hits)
-            transcript_hits = [(score, s) for score, s in all_hits if s.metadata.get("type") == "srt"]
 
             # Get the best frame if available
             best_frame = frame_info[0] if frame_info else None
 
-            # Get nearby transcript context
-            transcript_context = RAGIndex.render_for_prompt(transcript_hits[:3], max_snips=3, max_chars=300)
+            # Get transcript context - prioritize temporal proximity if we have a frame
+            if best_frame:
+                # Search for transcripts near the frame's timestamp
+                frame_timestamp_seconds = best_frame.get("timestamp_seconds")
+                if frame_timestamp_seconds:
+                    # Search with wider tolerance to get more context (before and after the frame)
+                    temporal_transcript_hits = await rag.search_transcript_by_timestamp(
+                        frame_timestamp_seconds,
+                        tolerance_seconds=30.0  # Look for transcripts within 30 seconds (15s before and after)
+                    )
+                    # Prioritize transcripts that overlap with or are very close to the frame timestamp
+                    # Sort by proximity to frame timestamp
+                    def proximity_score(hit):
+                        score, seg = hit
+                        start_s = seg.metadata.get("start_s", 0)
+                        end_s = seg.metadata.get("end_s", start_s + 5)
+                        # Calculate how close this segment is to the frame
+                        if start_s <= frame_timestamp_seconds <= end_s:
+                            return 2.0  # Within segment - highest priority
+                        else:
+                            distance = min(abs(start_s - frame_timestamp_seconds), abs(end_s - frame_timestamp_seconds))
+                            return 1.0 / (1.0 + distance)  # Closer = higher score
+
+                    # Re-score and sort by proximity
+                    temporal_transcript_hits = sorted(temporal_transcript_hits, key=proximity_score, reverse=True)
+
+                    # Also get semantic matches for additional context
+                    semantic_transcript_hits = [(score, s) for score, s in all_hits if s.metadata.get("type") == "srt"]
+                    # Combine: temporal matches first (up to 8), then semantic (up to 3)
+                    transcript_hits = temporal_transcript_hits[:8] + semantic_transcript_hits[:3]
+                else:
+                    # Fallback to semantic search if no timestamp
+                    transcript_hits = [(score, s) for score, s in all_hits if s.metadata.get("type") == "srt"]
+            else:
+                # No frame found, use semantic search for transcripts
+                transcript_hits = [(score, s) for score, s in all_hits if s.metadata.get("type") == "srt"]
+
+            # Get nearby transcript context (prioritize temporal matches)
+            # Use specialized transcript rendering for scene discussion
+            if transcript_hits:
+                transcript_context = RAGIndex.render_transcript_for_scene(transcript_hits, max_lines=6)
+            else:
+                transcript_context = "(no transcript lines found)"
 
             # Get recent chat context for the room
             recent = world.recent(a.room, n=10)
@@ -244,6 +284,19 @@ async def dispatch(agent_id: str, fn: dict):
             # Generate LLM response about the scene
             if best_frame:
                 system = config.get("system_prompt")
+
+                # Build transcript section - make it prominent
+                transcript_section = ""
+                if transcript_context and transcript_context != "(no transcript lines found)":
+                    transcript_section = f"""
+Transcript lines from around {best_frame['timestamp']}:
+{transcript_context}
+
+IMPORTANT: These transcript lines are from the exact moment or very close to the frame timestamp ({best_frame['timestamp']}). You MUST quote or reference at least one of these lines in your response to connect the visual moment with what's being said. Use the exact wording from the transcript.
+"""
+                else:
+                    transcript_section = f"\n(No transcript lines found for this exact moment ({best_frame['timestamp']}), but you can still describe the visual content.)\n"
+
                 user_prompt = f"""You are {a.profile.name}.
 
 Persona:
@@ -256,19 +309,20 @@ You just retrieved a scene from the video. Here's what you found:
 
 Frame at {best_frame['timestamp']}:
 {best_frame['caption']}
-
-Transcript context:
-{transcript_context if transcript_context != "(no relevant knowledge base lines found)" else "No specific transcript lines found for this moment."}
-
+{transcript_section}
 Generate a natural, conversational response about this scene. You should:
 - React to the visual content in the frame
+- QUOTE at least one transcript line above - these are from the exact moment shown in the frame
+- Connect the visual moment with what's being said in the transcript
+- Use the exact wording from the transcript when quoting
 - Connect it to the recent conversation if relevant
-- Reference the transcript if it adds context
 - Be authentic to your persona
 - Keep it conversational (2-4 sentences)
 - Mention the timestamp naturally (e.g., "at {best_frame['timestamp']}" or "around {best_frame['timestamp']}")
 
-Write your response as if you're sharing this scene with the group:"""
+Example of how to quote: "Look at this moment at {best_frame['timestamp']} - when they say '[quote from transcript]', you can see [visual description]. The way [character] reacts here really shows..."
+
+Write your response as if you're sharing this scene with the group. Make sure to include a direct quote from the transcript above:"""
 
                 try:
                     resp = await llm.chat(

@@ -266,6 +266,51 @@ class RAGIndex:
         matching_frames.sort(key=lambda x: -x[0])
         return matching_frames
 
+    async def search_transcript_by_timestamp(self, timestamp_seconds: float, tolerance_seconds: float = 15.0) -> List[Tuple[float, RAGSeg]]:
+        """Search for transcript lines near a specific timestamp in seconds."""
+        matching_transcripts = []
+
+        for seg in self.segs:
+            if seg.metadata.get("type") == "srt":
+                # SRT segments have start_s and end_s in metadata
+                start_s = seg.metadata.get("start_s")
+                end_s = seg.metadata.get("end_s")
+
+                if start_s is not None:
+                    try:
+                        # Check if the timestamp is within the segment or close to it
+                        segment_start = float(start_s)
+                        segment_end = float(end_s) if end_s is not None else segment_start + 5.0
+
+                        # Calculate distance to segment
+                        if segment_start <= timestamp_seconds <= segment_end:
+                            # Timestamp is within this segment - highest priority
+                            distance = 0.0
+                            score = 2.0  # Higher score for segments containing the timestamp
+                        elif timestamp_seconds < segment_start:
+                            # Timestamp is before this segment
+                            distance = segment_start - timestamp_seconds
+                            if distance <= tolerance_seconds:
+                                score = 1.0 / (1.0 + distance)
+                            else:
+                                continue
+                        else:
+                            # Timestamp is after this segment
+                            distance = timestamp_seconds - segment_end
+                            if distance <= tolerance_seconds:
+                                score = 1.0 / (1.0 + distance)
+                            else:
+                                continue
+
+                        matching_transcripts.append((score, seg))
+                    except (ValueError, TypeError) as e:
+                        # Skip segments with invalid timestamps
+                        continue
+
+        # Sort by score (closest first) and return
+        matching_transcripts.sort(key=lambda x: -x[0])
+        return matching_transcripts
+
     @staticmethod
     def render_for_prompt(hits: List[Tuple[float, RAGSeg]], max_snips: int = 4, max_chars: int = 500) -> str:
         lines = []
@@ -276,11 +321,36 @@ class RAGIndex:
 
             meta = s.metadata
             if meta.get("type") == "srt":
-                lines.append(f'- "{txt}" (SRT: {meta.get("start_tc")}–{meta.get("end_tc")})')
+                start_tc = meta.get("start_tc", "")
+                end_tc = meta.get("end_tc", "")
+                # Format for easy quoting: show timestamp and quote
+                lines.append(f'"{txt}" ({start_tc}–{end_tc})')
             else:
                 lines.append(f'- "{txt}" (File: {os.path.basename(s.file_path)})')
 
         return "\n".join(lines) if lines else "(no relevant knowledge base lines found)"
+
+    @staticmethod
+    def render_transcript_for_scene(hits: List[Tuple[float, RAGSeg]], max_lines: int = 6) -> str:
+        """Render transcript lines specifically for scene discussion - more focused format."""
+        srt_segments = []
+        for score, s in hits:
+            if s.metadata.get("type") != "srt":
+                continue
+            srt_segments.append((score, s))
+
+        # Sort by timestamp (chronological order) for better context flow
+        srt_segments.sort(key=lambda x: x[1].metadata.get("start_s", 0))
+
+        lines = []
+        for score, s in srt_segments[:max_lines]:
+            txt = s.raw.strip()
+            start_tc = s.metadata.get("start_tc", "")
+            end_tc = s.metadata.get("end_tc", "")
+            # Format: timestamp first, then quote (easier to reference)
+            lines.append(f'{start_tc}: "{txt}"')
+
+        return "\n".join(lines) if lines else "(no transcript lines found)"
 
     @staticmethod
     def extract_frame_info(hits: List[Tuple[float, RAGSeg]]) -> List[Dict[str, Any]]:
