@@ -1,10 +1,13 @@
 # LLM Queer Simulation
 
-A social simulation platform for AI agents interacting in various rooms, with configurable personas, system prompts, and RAG (Retrieval-Augmented Generation) support.
+A social simulation platform for AI agents interacting in various rooms, with configurable personas, system prompts, and RAG (Retrieval-Augmented Generation) support. Built with **Google ADK (Agent Development Kit)** for robust multi-agent orchestration.
 
 ## Features
 
-- **Multi-Agent Simulation**: AI agents with distinct personas interacting in real-time.
+- **Multi-Agent Simulation**: AI agents with distinct personas interacting in real-time using Google ADK orchestration.
+- **Parallel Agent Execution**: All three persona agents run simultaneously with full autonomy, each with independent tools and context search capabilities.
+- **Independent Context Search**: Each agent can independently search RAG knowledge bases based on their own perspective.
+- **Stateful Sessions**: Persistent conversation state and agent memory managed by ADK session service.
 - **Configurable Personas**: Easily change agent names and backgrounds via the frontend.
 - **Dynamic System Prompt**: Customize the core behavior of all agents.
 - **Generalized RAG Support**: Upload and use `.md`, `.txt`, and `.srt` files for agent knowledge.
@@ -14,7 +17,11 @@ A social simulation platform for AI agents interacting in various rooms, with co
 
 ## Project Structure
 
-- `queer-sim-backend/`: FastAPI server, agent logic, and RAG system.
+- `queer-sim-backend/`: FastAPI server with Google ADK orchestration, agent logic, and RAG system.
+  - `adk_sim/`: ADK-based simulation package with state management, tools, and agent definitions.
+  - `adk_sim/agents/`: Agent definitions (personas, root orchestration).
+  - `adk_sim/tools.py`: ADK tools for message sending, room movement, RAG search, scene retrieval.
+  - `adk_sim/state.py`: Session state schema and helpers.
 - `queer-sim-frontend/`: Next.js web interface.
 - `data/rag/`: Directory for RAG data files.
 
@@ -22,7 +29,8 @@ A social simulation platform for AI agents interacting in various rooms, with co
 
 ### Prerequisites
 
-- [Ollama](https://ollama.com/) installed and running.
+- **Google API Key** (recommended): For Gemini models via Google ADK. Get one from [Google AI Studio](https://makersuite.google.com/app/apikey).
+- [Ollama](https://ollama.com/) (optional fallback): If not using Google API, Ollama must be installed and running.
 - [FFmpeg](https://ffmpeg.org/) installed and available in PATH (for video/frame processing).
 - Python 3.9+
 - Node.js 18+
@@ -37,12 +45,21 @@ To use the YouTube ingestion feature, you need an OpenAI API key for translation
 
 ### LLM Setup
 
-1. Install Ollama and pull the models
+**Option 1: Google Gemini (Recommended)**
+
+1. Get a Google API key from [Google AI Studio](https://makersuite.google.com/app/apikey).
+2. Set the `GOOGLE_API_KEY` environment variable or add it to your `.env` file.
+
+**Option 2: Ollama (Fallback)**
+
+1. Install Ollama and pull the models:
 
    ```bash
    ollama pull qwen3
    ollama pull embeddinggemma
    ```
+
+2. The system will automatically use Ollama if no Google API key is provided.
 
 ### Backend Setup
 
@@ -56,8 +73,12 @@ To use the YouTube ingestion feature, you need an OpenAI API key for translation
    pip install -r requirements.txt
    ```
 
-3. (Optional) Configure environment variables in a `.env` file:
+3. Configure environment variables in a `.env` file:
    ```
+   # For Google Gemini (recommended)
+   GOOGLE_API_KEY=your_google_api_key_here
+
+   # OR for Ollama (fallback)
    OLLAMA_BASE=http://localhost:11434
    CHAT_MODEL=qwen3
    EMBED_MODEL=embeddinggemma
@@ -112,12 +133,61 @@ The simulation supports using external documents to inform agent conversations.
 3. Select the directory in the Settings page.
 4. Agents will now search these documents for relevant context during conversations.
 
+## Architecture
+
+The simulation uses **Google ADK** for agent orchestration with a parallel multi-agent architecture:
+
+### Agent Pipeline
+
+```mermaid
+graph TD
+    User[User Message] --> Root[ParallelAgent: QueerSimRoot]
+
+    Root --> A1[Persona Agent a1<br/>Noor K.]
+    Root --> A2[Persona Agent a2<br/>Ji-woo]
+    Root --> A3[Persona Agent a3<br/>Mika Tan]
+
+    A1 --> Tools1[Tools:<br/>- send_message<br/>- send_dm<br/>- move_room<br/>- wait<br/>- retrieve_scene<br/>- prepare_turn_context]
+    A2 --> Tools2[Tools:<br/>- send_message<br/>- send_dm<br/>- move_room<br/>- wait<br/>- retrieve_scene<br/>- prepare_turn_context]
+    A3 --> Tools3[Tools:<br/>- send_message<br/>- send_dm<br/>- move_room<br/>- wait<br/>- retrieve_scene<br/>- prepare_turn_context]
+
+    Tools1 --> State[ADK Session State]
+    Tools2 --> State
+    Tools3 --> State
+
+    State --> Outbox[Outbox Events]
+    Outbox --> WS[WebSocket Broadcast]
+
+    style Root fill:#e1f5ff
+    style A1 fill:#ffe1f5
+    style A2 fill:#f5ffe1
+    style A3 fill:#fff5e1
+    style State fill:#f0f0f0
+```
+
+### Key Features
+
+- **Parallel Execution**: All three persona agents run simultaneously with full autonomy
+- **Independent Context Search**: Each agent can independently search RAG using `prepare_turn_context` based on their own perspective
+- **Direct Tool Calls**: Agents call tools directly (e.g., `send_message`) rather than writing to shared state keys
+- **State Management**: ADK session service maintains conversation history, agent positions, and room state
+- **Event-Driven**: Tools emit events to an outbox that gets flushed to WebSocket clients
+- **Enhanced Scene Retrieval**: `retrieve_scene` tool returns both transcript text and frame image data
+
+The ADK implementation provides:
+- Robust error handling and recovery
+- Persistent state across turns
+- Structured workflow orchestration
+- Easy extensibility for new agent behaviors
+
+
 ## Open-Source Friendliness
 
 This project is designed to be easily customizable:
 - All hardcoded configurations have been moved to a central config system.
 - Personas and prompts are fully editable via the UI.
 - RAG system is generic and supports standard document formats.
+- Agent orchestration uses standard Google ADK patterns for easy modification.
 
 ## License
 

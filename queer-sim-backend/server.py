@@ -2,18 +2,29 @@
 Run `uvicorn server:app --reload --port 8000` to start the server.
 """
 
-import asyncio, json, time, random, os
+import asyncio, json, time, random, os, logging, re
 from typing import List
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from llm import OllamaClient
-from world import World
-from agents import Agent, AgentProfile
-from memory import MemoryStore
+from llm import OllamaClient, GeminiClient
 from rag_index import RAGIndex
 from config import config
 from youtube_ingest import YouTubeIngestManager
+
+# ADK Imports
+from adk_sim.state import get_initial_state
+from adk_sim.tools import set_rag_index
+from adk_sim.agents.root import root_agent
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService
+from google.adk.events.event import Event
+from google.adk.events.event_actions import EventActions
+from google.genai import types
+
+# Silence noisy google-genai warning logs when responses include function_call parts.
+# (ADK responses commonly include tool/function_call parts.)
+logging.getLogger("google_genai.types").setLevel(logging.ERROR)
 
 app = FastAPI()
 app.add_middleware(
@@ -26,19 +37,45 @@ app.add_middleware(
 
 CONNS: List[WebSocket] = []
 
-llm = OllamaClient(
-    config.get("ollama_base"),
-    config.get("chat_model"),
-    config.get("embed_model")
-)
+# Use Gemini for ADK and RAG if API key exists
+google_api_key = config.get("google_api_key")
+if google_api_key:
+    llm = GeminiClient(google_api_key)
+else:
+    llm = OllamaClient(
+        config.get("ollama_base"),
+        config.get("chat_model"),
+        config.get("embed_model"),
+    )
 
-world = World(
-    rooms={"group_chat": [], "cafe": [], "apartment": []},
-    room_desc=config.get("room_desc"),
-)
+# If GOOGLE_API_KEY isn't set, ADK's Gemini LlmAgents can't produce replies.
+# We fall back to lightweight scripted replies so the UI still feels interactive.
+HAS_GEMINI = bool(google_api_key)
 
 # Generalized RAG index
 rag = RAGIndex(llm.embed)
+set_rag_index(rag)
+
+# ADK Initialization
+session_service = InMemorySessionService()
+adk_runner = Runner(
+    agent=root_agent,
+    app_name="QueerSim",
+    session_service=session_service
+)
+# Fixed session ID for the single simulation "world" for now
+# or we can use one session per connection if we want isolated sims.
+# The plan says "One ADK session per conversation (maps to UI session)".
+GLOBAL_SESSION_ID = "default_sim"
+GLOBAL_USER_ID = "simulation_user"
+
+# Initialize global session
+session_service.create_session_sync(
+    app_name="QueerSim",
+    user_id=GLOBAL_USER_ID,
+    session_id=GLOBAL_SESSION_ID,
+    state=get_initial_state()
+)
 
 # YouTube Ingest Manager
 youtube_ingest = YouTubeIngestManager(config, rag)
@@ -54,404 +91,339 @@ async def broadcast(event):
         if ws in CONNS:
             CONNS.remove(ws)
 
-world.broadcast = broadcast
-
-def seed_agents_and_scene():
-    profiles = config.get("agent_profiles")
-    agents = {}
-    for aid, p in profiles.items():
-        agents[aid] = Agent(
-            AgentProfile(aid, p["name"], p["persona"]),
-            MemoryStore(llm.embed),
-            room="group_chat"
-        )
-
-    # Initialize room entry times
-    for agent in agents.values():
-        agent.room_entered_ts = time.time()
-
-    world.agents = agents
-
 async def seed_initial_chat():
-    """Seed the initial chat log into group_chat"""
-    initial_messages = config.get("initial_messages")
+    """Seed the initial chat log into group_chat.
 
+    Clears existing group_chat history and replaces it with initial messages from config.
+    This ensures that config changes are reflected when the server restarts or when
+    the RAG directory is changed.
+    """
+    initial_messages = config.get("initial_messages", [])
+    from adk_sim.state import add_message
+
+    # Get current session state
+    session = await session_service.get_session(
+        app_name="QueerSim",
+        user_id=GLOBAL_USER_ID,
+        session_id=GLOBAL_SESSION_ID
+    )
+    state = session.state
+
+    # Clear existing group_chat history to ensure we start fresh with config values
+    if "history" not in state:
+        state["history"] = {}
+    state["history"]["group_chat"] = []
+
+    # Clear outbox to avoid sending stale events
+    state["outbox"] = []
+
+    # Add initial messages from config
     for msg in initial_messages:
         sender = msg["sender"]
         text = msg["text"]
-        await world.post_message("group_chat", sender, text)
+        add_message(state, "group_chat", sender, text)
         await asyncio.sleep(0.1)  # Small delay between messages
 
-seed_agents_and_scene()
+    # Persist updated state (get_session returns a copy, so we need to apply the delta)
+    await apply_state_delta(
+        {"history": state.get("history", {}), "outbox": state.get("outbox", [])},
+        author="user"
+    )
+
+    # Flush outbox to broadcast initial messages to any connected clients
+    await flush_adk_outbox()
+
+    # Verify the state was persisted by re-reading the session
+    session_after = await session_service.get_session(
+        app_name="QueerSim",
+        user_id=GLOBAL_USER_ID,
+        session_id=GLOBAL_SESSION_ID
+    )
+    print(f"Seeded {len(initial_messages)} initial messages. Session history has {len(session_after.state.get('history', {}).get('group_chat', []))} messages.")
+
+async def apply_state_delta(delta: dict, author: str = "user"):
+    """Persist state updates into the ADK session store via a state-delta event.
+
+    NOTE: ADK expects `Event.author` to be either "user" or a known agent name.
+    Using "system" here causes noisy logs: "Event from an unknown agent: system".
+    """
+    session = await session_service.get_session(
+        app_name="QueerSim",
+        user_id=GLOBAL_USER_ID,
+        session_id=GLOBAL_SESSION_ID
+    )
+    if session is None:
+        return
+
+    event = Event(
+        author=author,
+        invocation_id=f"server-{time.time()}",
+        actions=EventActions(state_delta=delta),
+    )
+    await session_service.append_event(session=session, event=event)
+
+async def flush_adk_outbox():
+    """Flush the ADK state outbox to all WebSocket connections."""
+    session = await session_service.get_session(
+        app_name="QueerSim",
+        user_id=GLOBAL_USER_ID,
+        session_id=GLOBAL_SESSION_ID
+    )
+    outbox = session.state.get("outbox", [])
+    if not outbox:
+        return
+
+    print(f"[FLUSH] Flushing {len(outbox)} events from outbox")
+    for i, event in enumerate(outbox):
+        # Check if this is a message with frameReference
+        if event.get("type") == "message":
+            if event.get("frameReference"):
+                print(f"[FLUSH] Event {i}: message with frameReference: {event.get('from')} - frame_file: {event.get('frameReference', {}).get('frame_file')}")
+                # Ensure frameReference is properly structured
+                if not isinstance(event.get("frameReference"), dict):
+                    print(f"[FLUSH] WARNING: frameReference is not a dict: {type(event.get('frameReference'))}")
+            else:
+                print(f"[FLUSH] Event {i}: message without frameReference: {event.get('from')} - keys: {list(event.keys())}")
+                # Debug: print full event to see what's there
+                import json
+                print(f"[FLUSH] Full event {i}: {json.dumps(event, default=str)[:200]}")
+        elif event.get("type") == "frame_reference":
+            print(f"[FLUSH] Event {i}: frame_reference event: {event.get('frame_file')} for agent {event.get('agent')}")
+        else:
+            print(f"[FLUSH] Event {i}: {event.get('type')} - {str(event)[:100]}")
+        await broadcast(event)
+
+    # Clear outbox
+    await apply_state_delta({"outbox": []}, author="user")
+
+async def run_adk_turn(new_message_text: str):
+    """Run a full ADK turn based on a new message."""
+    async def run_scripted_fallback(note: str | None = None):
+        """Scripted fallback so the sim still works if Gemini is unavailable."""
+        session = await session_service.get_session(
+            app_name="QueerSim",
+            user_id=GLOBAL_USER_ID,
+            session_id=GLOBAL_SESSION_ID,
+        )
+        state = session.state
+        room = "group_chat"
+        agents = state.get("agents", [])
+        profiles = config.get("agent_profiles", {})
+
+        from adk_sim.state import add_message
+        if note:
+            add_message(state, room, "System", note)
+
+        templates = {
+            "a1": "I’m here. EP2 ending hit hard — what part landed for you most?",
+            "a2": "I hear you. Do we want a quick CW check-in before we unpack it?",
+            "a3": "NO because I’m STILL thinking about that last scene 😭 what did you yell at your screen?",
+        }
+        for a in agents:
+            aid = a.get("id")
+            name = a.get("name") or profiles.get(aid, {}).get("name") or aid
+            text = templates.get(aid) or "yeah, that was a lot — what stood out to you?"
+            add_message(state, room, name, text)
+
+        await apply_state_delta(
+            {"history": state.get("history", {}), "outbox": state.get("outbox", [])},
+            author="user",
+        )
+        await flush_adk_outbox()
+
+    if not HAS_GEMINI:
+        await run_scripted_fallback(
+            note="System: GOOGLE_API_KEY not set; using scripted replies. Set GOOGLE_API_KEY to enable Gemini-powered agents."
+        )
+        return
+
+    content = types.Content(role="user", parts=[types.Part(text=new_message_text)])
+
+    # Run the ADK runner
+    try:
+        # Build a lightweight history summary for instruction injection
+        session_for_summary = await session_service.get_session(
+            app_name="QueerSim",
+            user_id=GLOBAL_USER_ID,
+            session_id=GLOBAL_SESSION_ID
+        )
+        history_str = ""
+        if session_for_summary:
+            for room, msgs in session_for_summary.state.get("history", {}).items():
+                if msgs:
+                    history_str += f"\n#{room}:\n"
+                    for m in msgs[-10:]:
+                        history_str += f"- {m['from']}: {m['text']}\n"
+
+        profiles = config.get("agent_profiles", {})
+        captured_by_author: dict[str, str] = {}
+
+        async def _run():
+            async for _event in adk_runner.run_async(
+                user_id=GLOBAL_USER_ID,
+                session_id=GLOBAL_SESSION_ID,
+                new_message=content,
+                # Ensure ADK can inject these variables into agent instructions
+                state_delta={
+                    "new_message": new_message_text,
+                    "history_summary": history_str,
+                },
+            ):
+                # Primary path: agents call tools (send_message) which write to outbox.
+                # Fallback: if a persona agent outputs plain text, bridge it into chat so the UI still updates.
+                try:
+                    if (
+                        _event.author
+                        and _event.author != "user"
+                        and _event.author in profiles
+                        and _event.is_final_response()
+                        and _event.content
+                        and _event.content.parts
+                    ):
+                        text_parts: list[str] = []
+                        for part in _event.content.parts:
+                            if isinstance(part.text, str) and part.text.strip():
+                                # Skip hidden "thought" parts if present
+                                if isinstance(getattr(part, "thought", None), bool) and part.thought:
+                                    continue
+                                # Skip function_call parts - these are tool calls, not messages
+                                if hasattr(part, "function_call") and part.function_call:
+                                    continue
+                                text_parts.append(part.text)
+                        text = "".join(text_parts).strip()
+
+                        # Filter out tool call patterns before capturing
+                        if text:
+                            import re
+                            tool_call_pattern = r'^\s*(prepare_turn_context|retrieve_scene|send_message|send_dm|move_room|wait)\s*\([^)]*\)\s*$'
+                            if not re.match(tool_call_pattern, text.strip(), re.IGNORECASE):
+                                # Also check for JSON tool call structures
+                                if not (text.strip().startswith('{') and ('"function"' in text or '"tool"' in text or '"name"' in text)):
+                                    captured_by_author[_event.author] = text
+                except Exception:
+                    # Never fail the whole turn due to bridging logic.
+                    pass
+
+        # Guard against model/network hangs: fall back to scripted replies.
+        await asyncio.wait_for(_run(), timeout=20)
+
+        # ADK tools modify tool_context.state directly, and those changes should be automatically
+        # persisted. However, get_session() returns a deep copy, so we need to ensure we're
+        # reading the latest persisted state. Wait a bit for ADK to commit state changes.
+        await asyncio.sleep(0.3)
+
+        # Read the session state to get the outbox
+        session_after = await session_service.get_session(
+            app_name="QueerSim",
+            user_id=GLOBAL_USER_ID,
+            session_id=GLOBAL_SESSION_ID,
+        )
+        outbox = (session_after.state or {}).get("outbox", []) if session_after else []
+
+        print(f"[RUN_ADK] Session outbox has {len(outbox)} events after tool execution")
+        if outbox:
+            # Debug: Check if any messages have frameReference
+            has_frame_ref = False
+            for i, evt in enumerate(outbox):
+                if evt.get('type') == 'message' and 'frameReference' in evt:
+                    print(f"[RUN_ADK] Outbox event {i} has frameReference: {evt.get('frameReference')}")
+                    has_frame_ref = True
+                elif evt.get('type') == 'message':
+                    print(f"[RUN_ADK] Outbox event {i} is message without frameReference: {evt.get('from')}")
+                    # Debug: print the full event to see what's there
+                    import json
+                    print(f"[RUN_ADK] Full event {i}: {json.dumps(evt, default=str)[:300]}")
+                elif evt.get('type') == 'frame_reference':
+                    print(f"[RUN_ADK] Outbox event {i} is frame_reference event: {evt.get('frame_file')}")
+
+            # Flush the outbox - this will broadcast all events including frame_reference events
+            await flush_adk_outbox()
+            return
+
+        # If no tool-driven outbox events, bridge any captured persona text into chat/outbox.
+        if captured_by_author:
+            session_bridge = await session_service.get_session(
+                app_name="QueerSim",
+                user_id=GLOBAL_USER_ID,
+                session_id=GLOBAL_SESSION_ID,
+            )
+            state = session_bridge.state
+            from adk_sim.state import add_message
+
+            for author in sorted(captured_by_author.keys()):
+                display = profiles.get(author, {}).get("name") or author
+                add_message(state, "group_chat", display, captured_by_author[author])
+
+            await apply_state_delta(
+                {"history": state.get("history", {}), "outbox": state.get("outbox", [])},
+                author="user",
+            )
+            await flush_adk_outbox()
+            return
+
+        # Nothing happened: provide scripted fallback so the UI still shows interaction.
+        await run_scripted_fallback(
+            note="System: Agents produced no visible actions; using scripted replies for this turn."
+        )
+        return
+    except Exception as e:
+        print(f"ADK Turn error: {e}")
+        import traceback
+        traceback.print_exc()
+        await run_scripted_fallback(
+            note="System: Gemini/ADK turn failed; using scripted replies for this turn."
+        )
+
+# Replace run_reactions and run_dm_reaction with ADK turns
+async def run_reactions(trigger_msg):
+    # For now, just trigger an ADK turn with the message text
+    await run_adk_turn(trigger_msg["text"])
 
 async def run_dm_reaction(agent_name: str, trigger_msg):
-    """Handle agent response to a DM from the user."""
-    agent = next((a for a in world.agents.values() if a.profile.name == agent_name), None)
-    if not agent:
-        return
-
-    # Get recent DM history
-    key_parts = sorted(["You", agent_name])
-    dm_key = f"{key_parts[0]}:{key_parts[1]}"
-    recent_dms = world.dms.get(dm_key, [])[-20:]
-
-    # Get recent room context for the agent's current room
-    room = agent.room
-    recent_room = world.recent(room, n=10)
-    desc = world.room_desc.get(room, "")
-
-    # Search show subtitles and frames
-    query = f'You: {trigger_msg["text"]}\n' + "\n".join([m.get("text", "") for m in recent_dms[-5:]])
-    hits = await rag.search(query, k=5)
-    show_snips = RAGIndex.render_for_prompt(hits)
-
-    # Extract frame info for context
-    frame_info = RAGIndex.extract_frame_info(hits)
-    if frame_info:
-        frame_context = f"\n\nAvailable video frames matching this context:\n"
-        for i, frame in enumerate(frame_info[:2]):
-            frame_context += f"- {frame['timestamp']}: {frame['caption'][:100]}...\n"
-        show_snips += frame_context
-
-    # Create a DM-specific decision context
-    # The agent should respond in a more personal, direct way
-    try:
-        action = await agent.decide_dm(llm, recent_dms, trigger_msg, recent_room, desc, show_snips)
-        await dispatch(agent.profile.agent_id, action)
-    except Exception as e:
-        print(f"Agent {agent_name} DM decision failed: {e}")
-
-async def run_reactions(trigger_msg):
-    room = trigger_msg["room"]
-    recent = world.recent(room, n=20)
-    desc = world.room_desc.get(room, "")
-    available_rooms = list(world.rooms.keys())
-
-    # Search show subtitles and frames for relevant lines
-    query = f'{trigger_msg["from"]}: {trigger_msg["text"]}\n' + "\n".join([m["text"] for m in recent[-8:]])
-    hits = await rag.search(query, k=6)  # Get more hits to include both transcript and frames
-    show_snips = RAGIndex.render_for_prompt(hits)
-
-    # Extract frame info for context (agents can see what frames are available)
-    frame_info = RAGIndex.extract_frame_info(hits)
-    if frame_info:
-        frame_context = f"\n\nAvailable video frames matching this context:\n"
-        for i, frame in enumerate(frame_info[:3]):  # Show top 3 frames
-            frame_context += f"- {frame['timestamp']}: {frame['caption'][:100]}...\n"
-        show_snips += frame_context
-
-    tasks = []
-    agent_list = []
-    for a in world.agents.values():
-        if a.room == room and a.profile.name != trigger_msg["from"]:
-            tasks.append(a.decide(llm, room, desc, recent, trigger_msg, available_rooms, show_snips))
-            agent_list.append(a)
-
-    if not tasks:
-        return  # No agents to react
-
-    # Use gather with return_exceptions to handle individual agent failures
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    # Dispatch actions in a stable order based on agent IDs to reduce chaos
-    for aid in sorted(world.agents.keys()):
-        for i, a in enumerate(agent_list):
-            if a.profile.agent_id == aid:
-                if i < len(results):
-                    result = results[i]
-                    if isinstance(result, Exception):
-                        print(f"Agent {a.profile.name} decision failed: {result}")
-                        # Skip this agent's action
-                        continue
-                    action = result
-                    try:
-                        await dispatch(a.profile.agent_id, action)
-                    except Exception as e:
-                        print(f"Agent {a.profile.name} dispatch failed: {e}")
-                    # Small delay between agent actions
-                    await asyncio.sleep(0.5)
-
-async def dispatch(agent_id: str, fn: dict):
-    name = fn.get("name")
-    args = fn.get("arguments") or {}
-    a = world.agents[agent_id]
-
-    if name == "send_message":
-        text = (args.get("text") or "").strip()
-        if text:
-            await world.post_message(a.room, a.profile.name, text)
-
-    elif name == "send_dm":
-        to = args.get("to", "You")
-        text = (args.get("text") or "").strip()
-        if text:
-            await world.post_dm(a.profile.name, to, text)
-
-    elif name == "move_room":
-        room = args.get("room")
-        if room in world.rooms:
-            await world.move_agent(agent_id, room)
-
-    elif name == "retrieve_scene":
-        query = args.get("query", "")
-        if query:
-            # Check if query is a timestamp (e.g., "00:11:06,919" or "frame at 00:11:06,919")
-            import re
-            # Match timestamp pattern: HH:MM:SS,mmm or HH:MM:SS
-            timestamp_match = re.search(r'(\d{1,2}):(\d{2}):(\d{2})(?:[,.](\d{1,3}))?', query)
-            timestamp_str = None
-            if timestamp_match:
-                # Extract and normalize the timestamp
-                hh, mm, ss = timestamp_match.groups()[:3]
-                ms = timestamp_match.group(4) or "000"
-                # Pad milliseconds to 3 digits
-                ms = ms.ljust(3, '0')[:3]
-                timestamp_str = f"{hh.zfill(2)}:{mm}:{ss},{ms}"
-
-            # Search for frames - use timestamp search if we found a timestamp, otherwise semantic search
-            if timestamp_str:
-                # Search by timestamp first
-                timestamp_hits = await rag.search_frames_by_timestamp(timestamp_str, tolerance_seconds=10.0)
-                if timestamp_hits:
-                    # Found frames by timestamp, prioritize them but also add semantic results for context
-                    semantic_hits = await rag.search(query, k=3)
-                    all_hits = timestamp_hits + semantic_hits
-                else:
-                    # Timestamp search found nothing, fall back to semantic search
-                    print(f"No frames found at timestamp {timestamp_str}, using semantic search")
-                    all_hits = await rag.search(query, k=8)
-            else:
-                # Regular semantic search
-                all_hits = await rag.search(query, k=8)
-
-            frame_info = RAGIndex.extract_frame_info(all_hits)
-
-            # Get the best frame if available
-            best_frame = frame_info[0] if frame_info else None
-
-            # Get transcript context - prioritize temporal proximity if we have a frame
-            if best_frame:
-                # Search for transcripts near the frame's timestamp
-                frame_timestamp_seconds = best_frame.get("timestamp_seconds")
-                if frame_timestamp_seconds:
-                    # Search with wider tolerance to get more context (before and after the frame)
-                    temporal_transcript_hits = await rag.search_transcript_by_timestamp(
-                        frame_timestamp_seconds,
-                        tolerance_seconds=30.0  # Look for transcripts within 30 seconds (15s before and after)
-                    )
-                    # Prioritize transcripts that overlap with or are very close to the frame timestamp
-                    # Sort by proximity to frame timestamp
-                    def proximity_score(hit):
-                        score, seg = hit
-                        start_s = seg.metadata.get("start_s", 0)
-                        end_s = seg.metadata.get("end_s", start_s + 5)
-                        # Calculate how close this segment is to the frame
-                        if start_s <= frame_timestamp_seconds <= end_s:
-                            return 2.0  # Within segment - highest priority
-                        else:
-                            distance = min(abs(start_s - frame_timestamp_seconds), abs(end_s - frame_timestamp_seconds))
-                            return 1.0 / (1.0 + distance)  # Closer = higher score
-
-                    # Re-score and sort by proximity
-                    temporal_transcript_hits = sorted(temporal_transcript_hits, key=proximity_score, reverse=True)
-
-                    # Also get semantic matches for additional context
-                    semantic_transcript_hits = [(score, s) for score, s in all_hits if s.metadata.get("type") == "srt"]
-                    # Combine: temporal matches first (up to 8), then semantic (up to 3)
-                    transcript_hits = temporal_transcript_hits[:8] + semantic_transcript_hits[:3]
-                else:
-                    # Fallback to semantic search if no timestamp
-                    transcript_hits = [(score, s) for score, s in all_hits if s.metadata.get("type") == "srt"]
-            else:
-                # No frame found, use semantic search for transcripts
-                transcript_hits = [(score, s) for score, s in all_hits if s.metadata.get("type") == "srt"]
-
-            # Get nearby transcript context (prioritize temporal matches)
-            # Use specialized transcript rendering for scene discussion
-            if transcript_hits:
-                transcript_context = RAGIndex.render_transcript_for_scene(transcript_hits, max_lines=6)
-            else:
-                transcript_context = "(no transcript lines found)"
-
-            # Get recent chat context for the room
-            recent = world.recent(a.room, n=10)
-            recent_text = "\n".join([f'{m["from"]}: {m["text"]}' for m in recent[-8:]])
-
-            # Get agent persona
-            agent_profile = config.get("agent_profiles", {}).get(a.profile.agent_id, {})
-            persona = agent_profile.get("persona", "")
-
-            # Generate LLM response about the scene
-            if best_frame:
-                system = config.get("system_prompt")
-
-                # Build transcript section - make it prominent
-                transcript_section = ""
-                if transcript_context and transcript_context != "(no transcript lines found)":
-                    transcript_section = f"""
-Transcript lines from around {best_frame['timestamp']}:
-{transcript_context}
-
-IMPORTANT: These transcript lines are from the exact moment or very close to the frame timestamp ({best_frame['timestamp']}). You MUST quote or reference at least one of these lines in your response to connect the visual moment with what's being said. Use the exact wording from the transcript.
-"""
-                else:
-                    transcript_section = f"\n(No transcript lines found for this exact moment ({best_frame['timestamp']}), but you can still describe the visual content.)\n"
-
-                user_prompt = f"""You are {a.profile.name}.
-
-Persona:
-{persona}
-
-Recent chat in #{a.room}:
-{recent_text}
-
-You just retrieved a scene from the video. Here's what you found:
-
-Frame at {best_frame['timestamp']}:
-{best_frame['caption']}
-{transcript_section}
-Generate a natural, conversational response about this scene. You should:
-- React to the visual content in the frame
-- QUOTE at least one transcript line above - these are from the exact moment shown in the frame
-- Connect the visual moment with what's being said in the transcript
-- Use the exact wording from the transcript when quoting
-- Connect it to the recent conversation if relevant
-- Be authentic to your persona
-- Keep it conversational (2-4 sentences)
-- Mention the timestamp naturally (e.g., "at {best_frame['timestamp']}" or "around {best_frame['timestamp']}")
-
-Example of how to quote: "Look at this moment at {best_frame['timestamp']} - when they say '[quote from transcript]', you can see [visual description]. The way [character] reacts here really shows..."
-
-Write your response as if you're sharing this scene with the group. Make sure to include a direct quote from the transcript above:"""
-
-                try:
-                    resp = await llm.chat(
-                        messages=[
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": user_prompt}
-                        ]
-                    )
-                    frame_msg = (resp.get("message", {}).get("content") or "").strip()
-                    if not frame_msg:
-                        # Fallback if LLM doesn't return content
-                        frame_msg = f"看看这个画面 ({best_frame['timestamp']}): {best_frame['caption']}"
-                except Exception as e:
-                    print(f"Error generating scene response for {a.profile.name}: {e}")
-                    # Fallback message
-                    frame_msg = f"看看这个画面 ({best_frame['timestamp']}): {best_frame['caption']}"
-
-                # Send message with frame reference
-                await world.post_message(a.room, a.profile.name, frame_msg)
-
-                # Broadcast frame info for frontend to display
-                await broadcast({
-                    "type": "frame_reference",
-                    "agent": a.profile.name,
-                    "frame_file": best_frame["frame_file"],
-                    "timestamp": best_frame["timestamp"],
-                    "timestamp_seconds": best_frame["timestamp_seconds"],
-                    "caption": best_frame["caption"],
-                    "room": a.room,
-                    "ts": time.time()
-                })
-            else:
-                # No frame found, but might have transcript - generate response about transcript
-                if transcript_context and transcript_context != "(no relevant knowledge base lines found)":
-                    system = config.get("system_prompt")
-                    user_prompt = f"""You are {a.profile.name}.
-
-Persona:
-{persona}
-
-Recent chat in #{a.room}:
-{recent_text}
-
-You searched for "{query}" but couldn't find a specific frame. However, you found these transcript lines:
-
-{transcript_context}
-
-Generate a natural response about these transcript lines, connecting them to the conversation if relevant. Keep it conversational (1-3 sentences)."""
-
-                    try:
-                        resp = await llm.chat(
-                            messages=[
-                                {"role": "system", "content": system},
-                                {"role": "user", "content": user_prompt}
-                            ]
-                        )
-                        transcript_msg = (resp.get("message", {}).get("content") or "").strip()
-                        if not transcript_msg:
-                            transcript_msg = f"关于「{query}」:\n{transcript_context}"
-                    except Exception as e:
-                        print(f"Error generating transcript response for {a.profile.name}: {e}")
-                        transcript_msg = f"关于「{query}」:\n{transcript_context}"
-
-                    await world.post_message(a.room, a.profile.name, transcript_msg)
-                else:
-                    await world.post_message(a.room, a.profile.name, f"没找到关于「{query}」的画面或台词。")
-
-    elif name == "wait":
-        return
+    # Trigger ADK turn, tools will handle DM logic
+    await run_adk_turn(trigger_msg["text"])
 
 # ---------- Proactive loop ----------
 
 async def proactive_loop():
-    """Every 20-60 seconds, pick one agent to consider doing something."""
+    """Every 20-60 seconds, trigger an ADK turn."""
     while True:
-        # Random interval between 20-60 seconds
         await asyncio.sleep(random.uniform(20, 60))
 
-        # Pick a random agent
-        agents_list = list(world.agents.values())
-        if not agents_list:
-            continue
+        # 50% chance to just move agents slightly in state before turn
+        session = await session_service.get_session(
+            app_name="QueerSim",
+            user_id=GLOBAL_USER_ID,
+            session_id=GLOBAL_SESSION_ID,
+        )
 
-        agent = random.choice(agents_list)
-        room = agent.room
-        recent = world.recent(room, n=20)
-        desc = world.room_desc.get(room, "")
-        available_rooms = list(world.rooms.keys())
+        if random.random() < 0.5:
+            state = session.state
+            agents = state.get("agents", [])
+            if agents:
+                agent = random.choice(agents)
+                from adk_sim.state import update_agent_pos, add_to_outbox
 
-        # Search show subtitles and frames for proactive moments (use recent chat context)
-        query = "\n".join([m["text"] for m in recent[-8:]]) if recent else "show discussion"
-        hits = await rag.search(query, k=6)  # Get more hits to include both transcript and frames
-        show_snips = RAGIndex.render_for_prompt(hits)
+                new_pos = {"x": random.uniform(0.1, 0.9), "y": random.uniform(0.1, 0.9)}
+                update_agent_pos(state, agent["name"], agent["room"], new_pos)
+                add_to_outbox(
+                    state,
+                    {
+                        "type": "agent_state",
+                        "id": agent["id"],
+                        "name": agent["name"],
+                        "room": agent["room"],
+                        "pos": new_pos,
+                        "ts": time.time(),
+                    },
+                )
+                await apply_state_delta(
+                    {"agents": state.get("agents", []), "outbox": state.get("outbox", [])},
+                    author="user",
+                )
+                await flush_adk_outbox()
 
-        # Extract frame info for context
-        frame_info = RAGIndex.extract_frame_info(hits)
-        if frame_info:
-            frame_context = f"\n\nAvailable video frames matching this context:\n"
-            for i, frame in enumerate(frame_info[:3]):
-                frame_context += f"- {frame['timestamp']}: {frame['caption'][:100]}...\n"
-            show_snips += frame_context
-
-        # Trigger with "nothing happened, what do you do?"
-        trigger = {
-            "type": "proactive",
-            "from": "system",
-            "text": "nothing happened, what do you do?",
-            "room": room,
-            "ts": time.time()
-        }
-
-        try:
-            # 50% chance to just move slightly within the room if not deciding a major action
-            if random.random() < 0.5:
-                agent.pos = {"x": random.uniform(0.1, 0.9), "y": random.uniform(0.1, 0.9)}
-                await broadcast({
-                    "type": "agent_state",
-                    "id": agent.profile.agent_id,
-                    "name": agent.profile.name,
-                    "room": agent.room,
-                    "pos": agent.pos,
-                    "ts": time.time()
-                })
-
-            action = await agent.decide(llm, room, desc, recent, trigger, available_rooms, show_snips)
-            await dispatch(agent.profile.agent_id, action)
-        except Exception as e:
-            print(f"Proactive loop error for {agent.profile.name}: {e}")
-            # Continue the loop even if one agent fails
+        await run_adk_turn("nothing happened, what do you do?")
 
 # ---------- WebSocket ----------
 
@@ -459,7 +431,19 @@ async def proactive_loop():
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     CONNS.append(ws)
-    await ws.send_text(json.dumps({"type":"state", **world.snapshot()}))
+
+    # Get state from ADK session instead of world
+    session = await session_service.get_session(
+        app_name="QueerSim",
+        user_id=GLOBAL_USER_ID,
+        session_id=GLOBAL_SESSION_ID
+    )
+    sim_state = {
+        "rooms": session.state["rooms"],
+        "agents": session.state["agents"],
+        "history": session.state["history"]
+    }
+    await ws.send_text(json.dumps({"type":"state", **sim_state}))
 
     try:
         while True:
@@ -469,12 +453,29 @@ async def ws_endpoint(ws: WebSocket):
             if msg["type"] == "user_message":
                 room = msg["room"]
                 text = msg["text"]
-                trigger = await world.post_message(room, "You", text)
+
+                # Update ADK state
+                session = await session_service.get_session(
+                    app_name="QueerSim",
+                    user_id=GLOBAL_USER_ID,
+                    session_id=GLOBAL_SESSION_ID
+                )
+                from adk_sim.state import add_message
+                state = session.state
+                add_message(state, room, "You", text)
+                await apply_state_delta(
+                    {"history": state.get("history", {}), "outbox": state.get("outbox", [])},
+                    author="user"
+                )
+
+                # Broadcast user message immediately
+                await flush_adk_outbox()
+
+                # Run ADK turn for agent reactions
                 try:
-                    await run_reactions(trigger)
+                    await run_adk_turn(text)
                 except Exception as e:
                     print(f"Error running reactions: {e}")
-                    # Send error message to client
                     await ws.send_text(json.dumps({
                         "type": "error",
                         "message": f"Agent response error: {str(e)}"
@@ -483,10 +484,27 @@ async def ws_endpoint(ws: WebSocket):
             elif msg["type"] == "user_dm":
                 agent_name = msg["agent"]
                 text = msg["text"]
-                trigger = await world.post_dm("You", agent_name, text)
-                # Trigger agent response to DM
+
+                # Update ADK state
+                session = await session_service.get_session(
+                    app_name="QueerSim",
+                    user_id=GLOBAL_USER_ID,
+                    session_id=GLOBAL_SESSION_ID
+                )
+                from adk_sim.state import add_dm
+                state = session.state
+                add_dm(state, "You", agent_name, text)
+                await apply_state_delta(
+                    {"history": state.get("history", {}), "outbox": state.get("outbox", [])},
+                    author="user"
+                )
+
+                # Broadcast user DM immediately
+                await flush_adk_outbox()
+
+                # Run ADK turn for agent response
                 try:
-                    await run_dm_reaction(agent_name, trigger)
+                    await run_adk_turn(text)
                 except Exception as e:
                     print(f"Error running DM reaction: {e}")
                     await ws.send_text(json.dumps({

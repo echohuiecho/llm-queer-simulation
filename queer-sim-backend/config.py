@@ -99,15 +99,16 @@ Can accidentally bring "TikTok discourse energy" into a calm space"""
                 "Do not invent real-person rumors. Focus on the show and the chat context."
             ),
             "initial_messages": [
-                {"sender": "Mika Tan", "text": "ok EP2 ending???? I need a minute 😭"},
-                {"sender": "Noor K.", "text": "same. also Tina's micro-expressions in the quiet scenes… unreal."},
-                {"sender": "Ji-woo", "text": "can we do a quick CW note? ep2 has overdose/addiction + coercion vibes."}
+                {"sender": "Mika Tan", "text": "ok the whiplash in that ep… someone literally goes \"玩得開心，但別死了！\" (\"have fun, but don’t die\") like ??? i’m unwell"},
+                {"sender": "Noor K.", "text": "and the confrontation was SO intense—\"你是怎麼進來的？出去！…否則，我就報警\" (\"how did you get in? get out… or I’m calling the police\"). the tension was insane."},
+                {"sender": "Ji-woo", "text": "CW check: the episode talks explicitly about overdose/addiction (\"我哥哥吸毒過量，差點沒命\") + family crisis. can we keep it gentle in here?"}
             ],
             "rag_directory": "default",
             "openai_api_key": os.getenv("OPENAI_API_KEY", ""),
             "openai_base_url": os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
             "openai_translate_model": os.getenv("OPENAI_TRANSLATE_MODEL", "gpt-4o"),
             "openai_vision_model": os.getenv("OPENAI_VISION_MODEL", "gpt-4o"),
+            "google_api_key": os.getenv("GOOGLE_API_KEY", ""),
             "youtube_frame_scene_threshold": 0.3
         }
         self.data = self.load()
@@ -127,6 +128,7 @@ Can accidentally bring "TikTok discourse energy" into a calm space"""
                         "openai_base_url": os.getenv("OPENAI_BASE_URL"),
                         "openai_translate_model": os.getenv("OPENAI_TRANSLATE_MODEL"),
                         "openai_vision_model": os.getenv("OPENAI_VISION_MODEL"),
+                        "google_api_key": os.getenv("GOOGLE_API_KEY"),
                     }
                     for key, env_value in env_overrides.items():
                         if env_value and (not config.get(key) or config.get(key) == ""):

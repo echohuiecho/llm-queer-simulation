@@ -64,3 +64,6 @@ queer-sim-backend/data/rag/
 
 # Config files with secrets
 queer-sim-backend/config.json
+
+# references
+ref/

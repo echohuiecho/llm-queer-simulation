@@ -9,3 +9,6 @@ openai
 langdetect
 ffmpeg-python
 python-dotenv
+google-adk
+google-genai
+nest-asyncio
