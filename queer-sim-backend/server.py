@@ -15,7 +15,7 @@ from youtube_ingest import YouTubeIngestManager
 # ADK Imports
 from adk_sim.state import get_initial_state
 from adk_sim.tools import set_rag_index
-from adk_sim.agents.root import root_agent
+from adk_sim.agents.root import root_agent, create_root_agent_with_shuffled_order
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.adk.events.event import Event
@@ -58,6 +58,8 @@ set_rag_index(rag)
 
 # ADK Initialization
 session_service = InMemorySessionService()
+# Create initial runner with shuffled order
+# The root agent will be recreated with a new shuffled order before each turn
 adk_runner = Runner(
     agent=root_agent,
     app_name="QueerSim",
@@ -197,7 +199,23 @@ async def flush_adk_outbox():
     await apply_state_delta({"outbox": []}, author="user")
 
 async def run_adk_turn(new_message_text: str):
-    """Run a full ADK turn based on a new message."""
+    """Run a full ADK turn based on a new message.
+
+    Before each turn, we create a new root agent with shuffled persona agent order.
+    This ensures each agent sees state updates in a different order each turn,
+    making their responses more varied and natural.
+    """
+    # Create a new root agent with shuffled order for this turn
+    # This ensures agents see state updates in different orders each turn
+    shuffled_root_agent = create_root_agent_with_shuffled_order()
+
+    # Create a new runner with the shuffled root agent
+    turn_runner = Runner(
+        agent=shuffled_root_agent,
+        app_name="QueerSim",
+        session_service=session_service
+    )
+
     async def run_scripted_fallback(note: str | None = None):
         """Scripted fallback so the sim still works if Gemini is unavailable."""
         session = await session_service.get_session(
@@ -259,7 +277,7 @@ async def run_adk_turn(new_message_text: str):
         captured_by_author: dict[str, str] = {}
 
         async def _run():
-            async for _event in adk_runner.run_async(
+            async for _event in turn_runner.run_async(
                 user_id=GLOBAL_USER_ID,
                 session_id=GLOBAL_SESSION_ID,
                 new_message=content,

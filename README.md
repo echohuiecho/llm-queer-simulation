@@ -5,7 +5,7 @@ A social simulation platform for AI agents interacting in various rooms, with co
 ## Features
 
 - **Multi-Agent Simulation**: AI agents with distinct personas interacting in real-time using Google ADK orchestration.
-- **Parallel Agent Execution**: All three persona agents run simultaneously with full autonomy, each with independent tools and context search capabilities.
+- **Dynamic Sequential Agent Execution**: Persona agents run sequentially in a shuffled order each turn, ensuring each agent sees different state updates and produces more varied, contextual responses.
 - **Independent Context Search**: Each agent can independently search RAG knowledge bases based on their own perspective.
 - **Stateful Sessions**: Persistent conversation state and agent memory managed by ADK session service.
 - **Configurable Personas**: Easily change agent names and backgrounds via the frontend.
@@ -135,17 +135,21 @@ The simulation supports using external documents to inform agent conversations.
 
 ## Architecture
 
-The simulation uses **Google ADK** for agent orchestration with a parallel multi-agent architecture:
+The simulation uses **Google ADK** for agent orchestration with a dynamic sequential multi-agent architecture:
 
 ### Agent Pipeline
 
 ```mermaid
 graph TD
-    User[User Message] --> Root[ParallelAgent: QueerSimRoot]
+    User[User Message] --> Root[SequentialAgent: QueerSimRoot]
 
-    Root --> A1[Persona Agent a1<br/>Noor K.]
-    Root --> A2[Persona Agent a2<br/>Ji-woo]
-    Root --> A3[Persona Agent a3<br/>Mika Tan]
+    Root --> SequentialDeciders[SequentialAgent: SequentialDeciders<br/>Shuffled Order Each Turn]
+
+    SequentialDeciders --> A1[Persona Agent a1<br/>Noor K.]
+    A1 --> A2[Persona Agent a2<br/>Ji-woo]
+    A2 --> A3[Persona Agent a3<br/>Mika Tan]
+
+    Note1[Note: Agent order is shuffled<br/>each turn e.g. a2→a1→a3]
 
     A1 --> Tools1[Tools:<br/>- send_message<br/>- send_dm<br/>- move_room<br/>- wait<br/>- retrieve_scene<br/>- prepare_turn_context]
     A2 --> Tools2[Tools:<br/>- send_message<br/>- send_dm<br/>- move_room<br/>- wait<br/>- retrieve_scene<br/>- prepare_turn_context]
@@ -155,21 +159,25 @@ graph TD
     Tools2 --> State
     Tools3 --> State
 
-    State --> Outbox[Outbox Events]
+    State --> Dispatch[DispatchAgent]
+    Dispatch --> Outbox[Outbox Events]
     Outbox --> WS[WebSocket Broadcast]
 
     style Root fill:#e1f5ff
+    style SequentialDeciders fill:#d1e5ff
     style A1 fill:#ffe1f5
     style A2 fill:#f5ffe1
     style A3 fill:#fff5e1
     style State fill:#f0f0f0
+    style Dispatch fill:#e1ffe1
 ```
 
 ### Key Features
 
-- **Parallel Execution**: All three persona agents run simultaneously with full autonomy
+- **Dynamic Sequential Execution**: Persona agents run sequentially in a randomly shuffled order each turn, ensuring each agent sees different conversation states and produces more varied, contextual responses
+- **State-Aware Responses**: Each agent sees state updates from previous agents in the sequence, allowing them to build on each other's responses naturally
 - **Independent Context Search**: Each agent can independently search RAG using `prepare_turn_context` based on their own perspective
-- **Direct Tool Calls**: Agents call tools directly (e.g., `send_message`) rather than writing to shared state keys
+- **Output Collection**: Agents write their replies to state keys (`a1_reply`, `a2_reply`, `a3_reply`) which are then dispatched by a dedicated DispatchAgent
 - **State Management**: ADK session service maintains conversation history, agent positions, and room state
 - **Event-Driven**: Tools emit events to an outbox that gets flushed to WebSocket clients
 - **Enhanced Scene Retrieval**: `retrieve_scene` tool returns both transcript text and frame image data
