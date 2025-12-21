@@ -1,6 +1,19 @@
 from google.adk.agents import LlmAgent
 from config import config
-from ..tools import send_message, send_dm, move_room, wait, retrieve_scene, prepare_turn_context
+from ..tools import (
+    send_message,
+    send_dm,
+    move_room,
+    wait,
+    retrieve_scene,
+    prepare_turn_context,
+    add_scene_to_episode,
+    refine_scene,
+    propose_episode_complete,
+    vote_episode_complete,
+    propose_story_complete,
+    vote_story_complete,
+)
 from ..callbacks import detect_timestamps_in_output
 
 # Shared model name
@@ -63,10 +76,25 @@ When it feels natural, contribute ideas for:
 - Recent chat in room: {{history_summary}}
 - User's latest message: {{new_message}}
 - After calling prepare_turn_context, you'll have access to: {{turn_context.show_snips}} and {{turn_context.frame_context}}
+- Current webtoon JSON (if any): {{current_storyline_json}}
+- Storyline focus flag for this turn: {{storyline_focus}}
+- Current episode number: {{current_episode_number}}
 
 # Rules:
 - **IMPORTANT**: When the conversation is about the show, characters, or scenes, you MUST use prepare_turn_context BEFORE responding. This ensures your quotes and references are accurate.
-- If the conversation turns toward creating a webtoon/storyline, you may suggest 1 concrete scene idea (with 2-3 panel beats) in your persona voice.
+- If the conversation turns toward creating/continuing the webtoon, suggest 1 concrete beat and (when appropriate) use the tools to update the shared storyline JSON.
+- If {{storyline_focus}} is \"expand\" and a storyline exists, prefer doing ONE of:
+  - add_scene_to_episode(episode_number={{current_episode_number}}, scene_summary=..., panels=[...]) (or omit episode_number to default)
+  - refine_scene(episode_number={{current_episode_number}}, scene_number=..., refinements={...})
+  Then continue chatting normally.
+- **CRITICAL for webtoon tools**: When adding or refining scenes, ensure every panel has dialogue. Use formats like:
+  * "Character name: [spoken line]"
+  * "(Internal monologue) [thought]"
+  * "(Narration) [description]"
+  Only use empty string "" for truly silent moments (max 1-2 per scene).
+- Episode completion is agent-decided: propose_episode_complete(...) then vote_episode_complete(...). When 2/3 vote yes, the backend marks the episode complete and the UI will receive an episode_complete event.
+- IMPORTANT: Do NOT add/refine scenes for completed episodes. Always work on the current episode ({{current_episode_number}}).
+- Story ending is agent-decided: when you feel the entire story has a satisfying ending, use propose_story_complete(...) and then vote_story_complete(...). When 2/3 vote yes, the UI will receive a story_complete event.
 - You can use multiple tools in sequence (e.g., prepare_turn_context → then retrieve_scene if needed → then output your message)
 - Do NOT output tool calls or JSON in your final message. Output ONLY the final message text.
 - Do NOT reply with just "..." or other non-content. Write at least 1 complete sentence.
@@ -80,7 +108,22 @@ Be authentic to your persona and engage naturally with the conversation.
         model=MODEL_NAME,
         instruction=instruction,
         # Put prepare_turn_context first so it's more likely to be considered
-        tools=[prepare_turn_context, retrieve_scene, send_message, send_dm, move_room, wait],
+        tools=[
+            prepare_turn_context,
+            retrieve_scene,
+            # Webtoon continuation tools
+            add_scene_to_episode,
+            refine_scene,
+            propose_episode_complete,
+            vote_episode_complete,
+            propose_story_complete,
+            vote_story_complete,
+            # Messaging / movement
+            send_message,
+            send_dm,
+            move_room,
+            wait,
+        ],
         # Write the final message text into state so a downstream dispatcher can publish it
         output_key=f"{agent_id}_reply",
         # After model callback to detect timestamps in final output and retrieve frames

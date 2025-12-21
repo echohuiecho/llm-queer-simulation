@@ -19,6 +19,21 @@ type StorylineUpdateMsg = {
   storyline_json: string;
   ts: number
 };
+type EpisodeCompleteMsg = {
+  type: "episode_complete";
+  episode_number: number;
+  version: number;
+  room: string;
+  ts: number;
+  title?: string;
+};
+type StoryCompleteMsg = {
+  type: "story_complete";
+  version: number;
+  room: string;
+  ts: number;
+  title?: string;
+};
 
 type StateMsg = {
   type: "state";
@@ -343,6 +358,52 @@ export default function Home() {
         setCurrentStoryline(s.storyline);
         setStorylineVersion(s.version);
         // Auto-open panel when storyline is updated
+        setShowStorylinePanel(true);
+        return;
+      }
+
+      if (data.type === "episode_complete") {
+        const e = data as EpisodeCompleteMsg;
+        setEvents((prev) => [
+          ...prev,
+          {
+            id: `evt-${eventIdCounter.current++}`,
+            type: "system",
+            text: `Episode ${e.episode_number} completed${e.title ? `: ${e.title}` : ""} (v${e.version}).`,
+            ts: e.ts,
+            room: e.room,
+          },
+        ]);
+        setMessages((prev) => ({
+          ...prev,
+          [e.room]: [
+            ...(prev[e.room] ?? []),
+            { type: "system_message", room: e.room, text: `Episode ${e.episode_number} completed (v${e.version}).`, ts: e.ts } as any,
+          ].slice(-200),
+        }));
+        setShowStorylinePanel(true);
+        return;
+      }
+
+      if (data.type === "story_complete") {
+        const s = data as StoryCompleteMsg;
+        setEvents((prev) => [
+          ...prev,
+          {
+            id: `evt-${eventIdCounter.current++}`,
+            type: "system",
+            text: `Story complete${s.title ? `: ${s.title}` : ""} (v${s.version}).`,
+            ts: s.ts,
+            room: s.room,
+          },
+        ]);
+        setMessages((prev) => ({
+          ...prev,
+          [s.room]: [
+            ...(prev[s.room] ?? []),
+            { type: "system_message", room: s.room, text: `Story complete (v${s.version}).`, ts: s.ts } as any,
+          ].slice(-200),
+        }));
         setShowStorylinePanel(true);
         return;
       }

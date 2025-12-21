@@ -67,3 +67,6 @@ queer-sim-backend/config.json
 
 # references
 ref/
+
+# webtoon output
+webtoon_output/

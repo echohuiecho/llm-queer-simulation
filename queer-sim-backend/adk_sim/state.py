@@ -39,6 +39,16 @@ def get_initial_state() -> Dict[str, Any]:
         "storyline_triggered": False,     # milestone-trigger latch
         "storyline_review_status": "",    # pass/fail
         "review_feedback": "",            # reviewer feedback for refiner
+
+        # --- Webtoon continuation (episode progress + voting) ---
+        "current_episode_number": 1,
+        "last_storyline_update_ts": 0.0,
+        "episode_completion_proposals": {},  # agent_id -> {episode_number, reason, ts}
+        "episode_completion_votes": {},      # agent_id -> {episode_number, vote, ts}
+
+        # --- Story completion (overall ending) ---
+        "story_completion_proposals": {},  # agent_id -> {reason, ts}
+        "story_completion_votes": {},      # agent_id -> {vote, ts}
     }
 
 def add_to_outbox(state: Dict[str, Any], event: Dict[str, Any]):

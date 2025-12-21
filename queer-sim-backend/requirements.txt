@@ -12,3 +12,4 @@ python-dotenv
 google-adk
 google-genai
 nest-asyncio
+pillow

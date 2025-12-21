@@ -14,7 +14,7 @@ from youtube_ingest import YouTubeIngestManager
 
 # ADK Imports
 from adk_sim.state import get_initial_state
-from adk_sim.tools import set_rag_index, compute_storyline_milestone
+from adk_sim.tools import set_rag_index, compute_storyline_milestone, compute_storyline_expansion_milestone
 from adk_sim.agents.root import root_agent, create_root_agent_with_shuffled_order
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
@@ -209,7 +209,7 @@ async def run_adk_turn(new_message_text: str):
     # so we can optionally extend the pipeline with the webtoon storyline loop.
 
     async def run_scripted_fallback(note: str | None = None):
-        """Scripted fallback so the sim still works if Gemini is unavailable."""
+        """Context-aware fallback so the sim still works if Gemini/ADK fails."""
         session = await session_service.get_session(
             app_name="QueerSim",
             user_id=GLOBAL_USER_ID,
@@ -224,15 +224,50 @@ async def run_adk_turn(new_message_text: str):
         if note:
             add_message(state, room, "System", note)
 
-        templates = {
-            "a1": "I’m here. EP2 ending hit hard — what part landed for you most?",
-            "a2": "I hear you. Do we want a quick CW check-in before we unpack it?",
-            "a3": "NO because I’m STILL thinking about that last scene 😭 what did you yell at your screen?",
-        }
+        history = (state.get("history") or {}).get(room) or []
+        recent = [m for m in history[-10:] if isinstance(m, dict)]
+        anchor = ""
+        for m in reversed(recent):
+            if m.get("from") and m.get("from") != "System" and isinstance(m.get("text"), str) and m["text"].strip():
+                anchor = m["text"].strip()
+                break
+        if not anchor:
+            anchor = new_message_text.strip() if isinstance(new_message_text, str) and new_message_text.strip() else "that last point"
+
+        cur_story = state.get("current_storyline") if isinstance(state.get("current_storyline"), dict) else {}
+        title = cur_story.get("title") if isinstance(cur_story.get("title"), str) else ""
+        version = int(state.get("storyline_version") or 0)
+        try:
+            current_ep = int(state.get("current_episode_number") or 1)
+        except Exception:
+            current_ep = 1
+
+        def _fallback_text(aid: str) -> str:
+            if cur_story and title:
+                if aid == "a1":
+                    return (
+                        f"Quick check-in on our webtoon draft (v{version}) — for episode {current_ep}, "
+                        f"what’s the next clean beat after: “{anchor[:80]}”?"
+                    )
+                if aid == "a2":
+                    return (
+                        f"To keep episode {current_ep} coherent, should we add one bridging scene after "
+                        f"“{anchor[:70]}”? What do you want the last panel to *feel* like?"
+                    )
+                return (
+                    f"Okay wait I’m obsessed. For episode {current_ep}, do we add a new scene right after "
+                    f"“{anchor[:70]}” — like 3 vertical panels, punchy dialogue?"
+                )
+
+            if aid == "a1":
+                return f"I’m with you. When you say “{anchor[:90]}”, what’s the subtext you’re reading there?"
+            if aid == "a2":
+                return f"Same page. If we zoom in on “{anchor[:85]}”, what’s the key need/boundary in that moment?"
+            return f"Wait yes. “{anchor[:85]}” is SUCH a moment — what did you want to happen next?"
         for a in agents:
             aid = a.get("id")
             name = a.get("name") or profiles.get(aid, {}).get("name") or aid
-            text = templates.get(aid) or "yeah, that was a lot — what stood out to you?"
+            text = _fallback_text(str(aid))
             add_message(state, room, name, text)
 
         await apply_state_delta(
@@ -267,11 +302,14 @@ async def run_adk_turn(new_message_text: str):
 
         # Decide whether to trigger the webtoon storyline planning loop this turn.
         enable_storyline = False
+        storyline_focus = "chat"
         if session_for_summary and session_for_summary.state:
             tmp_state = dict(session_for_summary.state)
             tmp_state["new_message"] = new_message_text
             enable_storyline = compute_storyline_milestone(tmp_state, room="group_chat")
             print(f"[SERVER] Milestone check result: enable_storyline={enable_storyline}")
+            if not enable_storyline and compute_storyline_expansion_milestone(tmp_state, room="group_chat"):
+                storyline_focus = "expand"
 
         if enable_storyline:
             print(f"[SERVER] Triggering storyline planning loop")
@@ -309,6 +347,7 @@ async def run_adk_turn(new_message_text: str):
                 state_delta={
                     "new_message": new_message_text,
                     "history_summary": history_str,
+                    "storyline_focus": storyline_focus,
                 },
             ):
                 # Primary path: agents call tools (send_message) which write to outbox.
@@ -409,18 +448,27 @@ async def run_adk_turn(new_message_text: str):
             await flush_adk_outbox()
             return
 
-        # Nothing happened: provide scripted fallback so the UI still shows interaction.
-        await run_scripted_fallback(
-            note="System: Agents produced no visible actions; using scripted replies for this turn."
-        )
+        # Nothing happened: provide fallback so the UI still shows interaction.
+        await run_scripted_fallback(note="System: Agents produced no visible actions; using fallback replies for this turn.")
         return
     except Exception as e:
         print(f"ADK Turn error: {e}")
         import traceback
         traceback.print_exc()
-        await run_scripted_fallback(
-            note="System: Gemini/ADK turn failed; using scripted replies for this turn."
-        )
+        # If any tool output already landed in outbox, flush it instead of spamming fallback.
+        try:
+            session_err = await session_service.get_session(
+                app_name="QueerSim",
+                user_id=GLOBAL_USER_ID,
+                session_id=GLOBAL_SESSION_ID,
+            )
+            outbox_err = (session_err.state or {}).get("outbox", []) if session_err else []
+            if outbox_err:
+                await flush_adk_outbox()
+                return
+        except Exception:
+            pass
+        await run_scripted_fallback(note="System: Gemini/ADK turn failed; using fallback replies for this turn.")
 
 # Replace run_reactions and run_dm_reaction with ADK turns
 async def run_reactions(trigger_msg):

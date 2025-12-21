@@ -13,7 +13,11 @@ about two masc lesbians. Produce a clear storyline with vertically-stacked panel
 Hard requirements:
 - Exactly 2 main characters (both masc lesbians), each with name, description, visual_description.
 - Story is structured as episodes/scenes with multiple vertical panels.
-- Each panel has visual_description and dialogue (can be empty string if silent).
+- Each panel MUST have dialogue. Dialogue can be:
+  * Spoken dialogue: "Character name: [what they say]"
+  * Internal monologue: "(Internal monologue) [thought]"
+  * Action/narration: "(Narration) [description]"
+  * Empty string ONLY for truly silent moments (use sparingly, max 1-2 panels per scene).
 - Keep it grounded, emotionally coherent, and scene-to-scene progression makes sense.
 - Ideas can be inspired by the current conversation + any retrieved context (subtitles/frames).
 """
@@ -63,6 +67,14 @@ JSON schema to output (STRICT JSON, no markdown, no comments):
 }}
 
 Make at least 3 scenes, each with at least 3 panels (vertical scroll feel).
+
+CRITICAL: Every panel MUST have dialogue. Use formats like:
+- "Hana: [spoken line]"
+- "Soo-jin: [spoken line]"
+- "(Internal monologue) [thought]"
+- "(Narration) [description]"
+Only use empty string "" for truly silent moments (max 1-2 per scene).
+
 After calling plan_storyline, do NOT output anything else.
 """,
         tools=[prepare_turn_context, retrieve_scene, plan_storyline],
@@ -86,6 +98,8 @@ You must:
 2) If the tool result is pass: call exit_loop() and respond with:
    "Storyline meets all requirements. Exiting the refinement loop."
 3) If fail: output concise actionable feedback (1-6 bullet points) about what to fix next.
+
+IMPORTANT: Check that most panels have dialogue. If too many panels have empty dialogue, provide feedback to add dialogue (spoken lines, internal monologue, or narration).
 
 Do not add extra prose. Either call exit_loop and return the completion message OR provide feedback.
 """,
@@ -114,6 +128,7 @@ Task:
 - Keep it STRICT JSON matching the schema.
 - Maintain exactly 2 main characters.
 - Ensure scenes/panels are webtoon-friendly (vertical stacking).
+- CRITICAL: Ensure every panel has dialogue. Use formats like "Character: [line]", "(Internal monologue) [thought]", or "(Narration) [text]". Only use "" for truly silent moments (max 1-2 per scene).
 
 Output instructions:
 1) Produce STRICT JSON string only.

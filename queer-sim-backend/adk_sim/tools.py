@@ -183,14 +183,21 @@ def review_storyline(
                 if not isinstance(panels, list) or len(panels) < 3:
                     issues.append(f"scenes[{si}].panels must have at least 3 panels (vertical scroll feel).")
                 else:
+                    empty_dialogue_count = 0
                     for pi, p in enumerate(panels[:5]):
                         if not isinstance(p, dict):
                             issues.append(f"scenes[{si}].panels[{pi}] must be an object.")
                             continue
                         if not (p.get("visual_description") and isinstance(p.get("visual_description"), str)):
                             issues.append(f"scenes[{si}].panels[{pi}].visual_description must be a string.")
-                        if not (p.get("dialogue") and isinstance(p.get("dialogue"), str)):
+                        dialogue = p.get("dialogue")
+                        if not isinstance(dialogue, str):
                             issues.append(f"scenes[{si}].panels[{pi}].dialogue must be a string.")
+                        elif not dialogue.strip():
+                            empty_dialogue_count += 1
+                    # Warn if too many panels have empty dialogue
+                    if empty_dialogue_count > 2:
+                        issues.append(f"scenes[{si}] has too many panels with empty dialogue ({empty_dialogue_count}). Add dialogue (spoken lines, internal monologue, or narration) to most panels. Only use empty string for truly silent moments (max 1-2 per scene).")
 
     if issues:
         feedback = "Needs work:\n- " + "\n- ".join(issues)
@@ -256,6 +263,402 @@ def exit_loop(*, tool_context: ToolContext) -> Dict[str, Any]:
     add_message(state, "group_chat", "System", f"Storyline refinement complete (v{version}).")
     return {}
 
+def _get_agent_id_from_tool_context(tool_context: ToolContext) -> str:
+    agent_name = getattr(tool_context, "agent_name", None)
+    agent_id = agent_name or getattr(tool_context, "agent_id", None) or getattr(tool_context, "author", None)
+    return str(agent_id) if agent_id else "unknown"
+
+def _bump_storyline_version(state: Dict[str, Any]) -> int:
+    """Increment storyline_version and keep current_storyline_json/meta updated."""
+    version = int(state.get("storyline_version") or 0) + 1
+    state["storyline_version"] = version
+    state["storyline_iteration"] = int(state.get("storyline_iteration") or 0) + 1
+    state["last_storyline_update_ts"] = time.time()
+
+    cur = state.get("current_storyline")
+    if isinstance(cur, dict):
+        cur.setdefault("meta", {})
+        if isinstance(cur.get("meta"), dict):
+            cur["meta"]["version"] = version
+            cur["meta"]["updated_ts"] = time.time()
+        try:
+            state["current_storyline_json"] = json.dumps(cur, ensure_ascii=False)
+        except Exception:
+            pass
+    return version
+
+def _emit_storyline_update(state: Dict[str, Any], *, room: str = "group_chat"):
+    cur = state.get("current_storyline")
+    payload = cur if isinstance(cur, dict) else {}
+    add_to_outbox(
+        state,
+        {
+            "type": "storyline_update",
+            "version": int(state.get("storyline_version") or 0),
+            "room": room,
+            "storyline": payload,
+            "storyline_json": state.get("current_storyline_json") or "{}",
+            "ts": time.time(),
+        },
+    )
+
+def add_scene_to_episode(
+    episode_number: Optional[int] = None,
+    scene_summary: str,
+    panels: List[Dict[str, Any]],
+    room: str = "group_chat",
+    *,
+    tool_context: ToolContext,
+) -> Dict[str, Any]:
+    """Add a new scene to the current episode (or a specified episode if provided)."""
+    state = tool_context.state
+    cur = state.get("current_storyline")
+    if not isinstance(cur, dict) or not cur:
+        return {"result": "fail", "message": "No current_storyline exists yet."}
+
+    if episode_number is None:
+        try:
+            episode_number = int(state.get("current_episode_number") or 1)
+        except Exception:
+            episode_number = 1
+
+    # Prevent adding scenes to completed episodes
+    meta = cur.get("meta") if isinstance(cur.get("meta"), dict) else {}
+    episodes_meta = meta.get("episodes") if isinstance(meta, dict) else {}
+    if isinstance(episodes_meta, dict):
+        ep_info = episodes_meta.get(str(int(episode_number)))
+        if isinstance(ep_info, dict) and ep_info.get("complete") is True:
+            try:
+                current_ep = int(state.get("current_episode_number") or (int(episode_number) + 1))
+            except Exception:
+                current_ep = int(episode_number) + 1
+            add_message(state, room, "System", f"Episode {episode_number} is complete. Please add scenes to episode {current_ep}.")
+            return {
+                "result": "fail",
+                "message": f"Episode {episode_number} is already complete. Work on episode {current_ep} instead.",
+            }
+
+    scenes = cur.get("scenes")
+    if not isinstance(scenes, list):
+        scenes = []
+        cur["scenes"] = scenes
+
+    if not isinstance(panels, list) or not panels:
+        return {"result": "fail", "message": "panels must be a non-empty list."}
+
+    normalized_panels: list[dict[str, Any]] = []
+    next_panel_num = 1
+    for p in panels:
+        if not isinstance(p, dict):
+            continue
+        normalized_panels.append(
+            {
+                "panel_number": int(p.get("panel_number") or next_panel_num),
+                "visual_description": str(p.get("visual_description") or ""),
+                "dialogue": str(p.get("dialogue") or ""),
+                "mood": str(p.get("mood") or ""),
+            }
+        )
+        next_panel_num += 1
+    if not normalized_panels:
+        return {"result": "fail", "message": "No valid panel objects provided."}
+
+    max_scene_num = 0
+    for s in scenes:
+        if isinstance(s, dict) and int(s.get("episode") or 0) == int(episode_number):
+            try:
+                max_scene_num = max(max_scene_num, int(s.get("scene_number") or 0))
+            except Exception:
+                pass
+    new_scene_number = max_scene_num + 1
+
+    scenes.append(
+        {
+            "episode": int(episode_number),
+            "scene_number": int(new_scene_number),
+            "summary": str(scene_summary or ""),
+            "panels": normalized_panels,
+        }
+    )
+
+    version = _bump_storyline_version(state)
+    _emit_storyline_update(state, room=room)
+    add_message(state, room, "System", f"Added scene {episode_number}.{new_scene_number} (v{version}).")
+    return {"result": "ok", "version": version, "episode": int(episode_number), "scene_number": int(new_scene_number)}
+
+def refine_scene(
+    episode_number: int,
+    scene_number: int,
+    refinements: Dict[str, Any],
+    room: str = "group_chat",
+    *,
+    tool_context: ToolContext,
+) -> Dict[str, Any]:
+    """Refine an existing scene by adding panels or updating panel fields."""
+    state = tool_context.state
+    cur = state.get("current_storyline")
+    if not isinstance(cur, dict) or not cur:
+        return {"result": "fail", "message": "No current_storyline exists yet."}
+
+    # Prevent refining completed episodes
+    meta = cur.get("meta") if isinstance(cur.get("meta"), dict) else {}
+    episodes_meta = meta.get("episodes") if isinstance(meta, dict) else {}
+    if isinstance(episodes_meta, dict):
+        ep_info = episodes_meta.get(str(int(episode_number)))
+        if isinstance(ep_info, dict) and ep_info.get("complete") is True:
+            try:
+                current_ep = int(state.get("current_episode_number") or (int(episode_number) + 1))
+            except Exception:
+                current_ep = int(episode_number) + 1
+            add_message(state, room, "System", f"Episode {episode_number} is complete. Please refine episode {current_ep} instead.")
+            return {
+                "result": "fail",
+                "message": f"Episode {episode_number} is already complete. Refine episode {current_ep} instead.",
+            }
+
+    scenes = cur.get("scenes")
+    if not isinstance(scenes, list) or not scenes:
+        return {"result": "fail", "message": "current_storyline.scenes is empty."}
+
+    target: Optional[dict[str, Any]] = None
+    for s in scenes:
+        if not isinstance(s, dict):
+            continue
+        if int(s.get("episode") or 0) == int(episode_number) and int(s.get("scene_number") or 0) == int(scene_number):
+            target = s
+            break
+    if not target:
+        return {"result": "fail", "message": f"Scene not found: episode={episode_number}, scene_number={scene_number}."}
+
+    if not isinstance(refinements, dict):
+        refinements = {}
+
+    if "summary" in refinements and isinstance(refinements.get("summary"), str):
+        target["summary"] = refinements["summary"]
+
+    panels = target.get("panels")
+    if not isinstance(panels, list):
+        panels = []
+        target["panels"] = panels
+
+    max_panel_num = 0
+    for p in panels:
+        if isinstance(p, dict):
+            try:
+                max_panel_num = max(max_panel_num, int(p.get("panel_number") or 0))
+            except Exception:
+                pass
+
+    panels_to_add = refinements.get("panels_to_add")
+    if isinstance(panels_to_add, list) and panels_to_add:
+        for raw in panels_to_add:
+            if not isinstance(raw, dict):
+                continue
+            max_panel_num += 1
+            panels.append(
+                {
+                    "panel_number": int(raw.get("panel_number") or max_panel_num),
+                    "visual_description": str(raw.get("visual_description") or ""),
+                    "dialogue": str(raw.get("dialogue") or ""),
+                    "mood": str(raw.get("mood") or ""),
+                }
+            )
+
+    def _apply_map(update_map: Any, field: str):
+        if not isinstance(update_map, dict):
+            return
+        for p in panels:
+            if not isinstance(p, dict):
+                continue
+            pn = p.get("panel_number")
+            try:
+                key = str(int(pn))
+            except Exception:
+                key = str(pn)
+            if key in update_map and isinstance(update_map[key], str):
+                p[field] = update_map[key]
+
+    _apply_map(refinements.get("dialogue_updates"), "dialogue")
+    _apply_map(refinements.get("visual_updates"), "visual_description")
+    _apply_map(refinements.get("mood_updates"), "mood")
+
+    version = _bump_storyline_version(state)
+    _emit_storyline_update(state, room=room)
+    add_message(state, room, "System", f"Refined scene {episode_number}.{scene_number} (v{version}).")
+    return {"result": "ok", "version": version, "episode": int(episode_number), "scene_number": int(scene_number)}
+
+def propose_episode_complete(
+    episode_number: int,
+    completion_reason: str,
+    room: str = "group_chat",
+    *,
+    tool_context: ToolContext,
+) -> Dict[str, Any]:
+    """Store an episode completion proposal from the calling agent."""
+    state = tool_context.state
+    agent_id = _get_agent_id_from_tool_context(tool_context)
+    proposals = state.get("episode_completion_proposals")
+    if not isinstance(proposals, dict):
+        proposals = {}
+        state["episode_completion_proposals"] = proposals
+    proposals[agent_id] = {
+        "episode_number": int(episode_number),
+        "reason": str(completion_reason or ""),
+        "ts": time.time(),
+    }
+    add_message(state, room, "System", f"{agent_id} proposed completing episode {episode_number}.")
+    return {"result": "ok", "episode_number": int(episode_number), "agent_id": agent_id}
+
+def _check_episode_completion_votes(state: Dict[str, Any], *, episode_number: int) -> bool:
+    votes = state.get("episode_completion_votes")
+    if not isinstance(votes, dict):
+        return False
+    yes = 0
+    for aid in ["a1", "a2", "a3"]:
+        v = votes.get(aid)
+        if not isinstance(v, dict):
+            continue
+        if int(v.get("episode_number") or 0) != int(episode_number):
+            continue
+        if bool(v.get("vote")):
+            yes += 1
+    return yes >= 2
+
+def vote_episode_complete(
+    episode_number: int,
+    vote: bool,
+    room: str = "group_chat",
+    *,
+    tool_context: ToolContext,
+) -> Dict[str, Any]:
+    """Vote on episode completion. If 2/3 vote yes, mark episode complete and emit episode_complete."""
+    state = tool_context.state
+    agent_id = _get_agent_id_from_tool_context(tool_context)
+    votes = state.get("episode_completion_votes")
+    if not isinstance(votes, dict):
+        votes = {}
+        state["episode_completion_votes"] = votes
+    votes[agent_id] = {"episode_number": int(episode_number), "vote": bool(vote), "ts": time.time()}
+
+    if _check_episode_completion_votes(state, episode_number=int(episode_number)):
+        cur = state.get("current_storyline")
+        if isinstance(cur, dict):
+            cur.setdefault("meta", {})
+            if isinstance(cur.get("meta"), dict):
+                cur["meta"].setdefault("episodes", {})
+                if isinstance(cur["meta"].get("episodes"), dict):
+                    ep_key = str(int(episode_number))
+                    cur["meta"]["episodes"].setdefault(ep_key, {})
+                    if isinstance(cur["meta"]["episodes"][ep_key], dict):
+                        cur["meta"]["episodes"][ep_key]["complete"] = True
+                        cur["meta"]["episodes"][ep_key]["completed_ts"] = time.time()
+
+        version = _bump_storyline_version(state)
+        _emit_storyline_update(state, room=room)
+        add_to_outbox(
+            state,
+            {
+                "type": "episode_complete",
+                "episode_number": int(episode_number),
+                "version": version,
+                "room": room,
+                "ts": time.time(),
+                "title": (state.get("current_storyline") or {}).get("title", "")
+                if isinstance(state.get("current_storyline"), dict)
+                else "",
+            },
+        )
+        add_message(state, room, "System", f"Episode {episode_number} marked complete (v{version}).")
+
+        state["episode_completion_proposals"] = {}
+        state["episode_completion_votes"] = {}
+        try:
+            next_ep = int(episode_number) + 1
+            state["current_episode_number"] = next_ep
+        except Exception:
+            next_ep = 1
+            state["current_episode_number"] = 1
+
+        add_message(state, room, "System", f"Episode {episode_number} complete. Starting work on Episode {next_ep}.")
+
+        return {"result": "ok", "completed": True, "episode_number": int(episode_number), "version": version}
+
+    return {"result": "ok", "completed": False, "episode_number": int(episode_number), "agent_id": agent_id}
+
+def propose_story_complete(
+    completion_reason: str,
+    room: str = "group_chat",
+    *,
+    tool_context: ToolContext,
+) -> Dict[str, Any]:
+    """Store a proposal that the overall story is complete (does not complete it)."""
+    state = tool_context.state
+    agent_id = _get_agent_id_from_tool_context(tool_context)
+    proposals = state.get("story_completion_proposals")
+    if not isinstance(proposals, dict):
+        proposals = {}
+        state["story_completion_proposals"] = proposals
+    proposals[agent_id] = {"reason": str(completion_reason or ""), "ts": time.time()}
+    add_message(state, room, "System", f"{agent_id} proposed that the story is complete.")
+    return {"result": "ok", "agent_id": agent_id}
+
+def _check_story_completion_votes(state: Dict[str, Any]) -> bool:
+    votes = state.get("story_completion_votes")
+    if not isinstance(votes, dict):
+        return False
+    yes = 0
+    for aid in ["a1", "a2", "a3"]:
+        v = votes.get(aid)
+        if not isinstance(v, dict):
+            continue
+        if bool(v.get("vote")):
+            yes += 1
+    return yes >= 2
+
+def vote_story_complete(
+    vote: bool,
+    room: str = "group_chat",
+    *,
+    tool_context: ToolContext,
+) -> Dict[str, Any]:
+    """Vote on whether the overall story is complete. If 2/3 vote yes, mark story_complete and emit story_complete."""
+    state = tool_context.state
+    agent_id = _get_agent_id_from_tool_context(tool_context)
+    votes = state.get("story_completion_votes")
+    if not isinstance(votes, dict):
+        votes = {}
+        state["story_completion_votes"] = votes
+    votes[agent_id] = {"vote": bool(vote), "ts": time.time()}
+
+    if _check_story_completion_votes(state):
+        cur = state.get("current_storyline")
+        if isinstance(cur, dict):
+            cur.setdefault("meta", {})
+            if isinstance(cur.get("meta"), dict):
+                cur["meta"]["story_complete"] = True
+                cur["meta"]["story_completed_ts"] = time.time()
+
+        version = _bump_storyline_version(state)
+        _emit_storyline_update(state, room=room)
+        add_to_outbox(
+            state,
+            {
+                "type": "story_complete",
+                "version": version,
+                "room": room,
+                "ts": time.time(),
+                "title": (state.get("current_storyline") or {}).get("title", "")
+                if isinstance(state.get("current_storyline"), dict)
+                else "",
+            },
+        )
+        add_message(state, room, "System", f"Story marked complete (v{version}).")
+        state["story_completion_proposals"] = {}
+        state["story_completion_votes"] = {}
+        return {"result": "ok", "completed": True, "version": version}
+
+    return {"result": "ok", "completed": False, "agent_id": agent_id}
+
 
 def compute_storyline_milestone(
     state: Dict[str, Any],
@@ -317,6 +720,58 @@ def compute_storyline_milestone(
         return True
 
     print(f"[MILESTONE] No milestone reached: history_count={history_count}, keyword_match={keyword_match}")
+    return False
+
+def compute_storyline_expansion_milestone(
+    state: Dict[str, Any],
+    *,
+    room: str = "group_chat",
+    min_messages_since_update: int = 6,
+) -> bool:
+    """Steer personas to continue/refine the existing storyline (without rerunning planning loop)."""
+    cur = state.get("current_storyline")
+    if not isinstance(cur, dict) or not cur:
+        return False
+
+    # Don't push expansion if current episode already complete
+    try:
+        current_ep = int(state.get("current_episode_number") or 1)
+    except Exception:
+        current_ep = 1
+    meta = cur.get("meta") if isinstance(cur.get("meta"), dict) else {}
+    episodes_meta = meta.get("episodes") if isinstance(meta, dict) else {}
+    if isinstance(episodes_meta, dict):
+        ep_info = episodes_meta.get(str(current_ep))
+        if isinstance(ep_info, dict) and ep_info.get("complete") is True:
+            return False
+
+    history = (state.get("history") or {}).get(room) or []
+    if not isinstance(history, list) or not history:
+        return False
+
+    last_update_ts = float(state.get("last_storyline_update_ts") or 0.0)
+    msgs_since_update = 0
+    for m in reversed(history):
+        if not isinstance(m, dict):
+            continue
+        ts = float(m.get("ts") or 0.0)
+        if ts <= last_update_ts:
+            break
+        msgs_since_update += 1
+
+    keywords = ["webtoon", "웹툰", "comic", "manhwa", "panel", "panels", "scene", "scenes", "episode", "storyline", "plot"]
+    latest = state.get("new_message") or ""
+    text_blob = str(latest)
+    if not text_blob and history:
+        tail = history[-8:]
+        text_blob = " ".join(str(m.get("text", "")) for m in tail if isinstance(m, dict))
+    text_lower = text_blob.lower()
+    keyword_match = any(k in text_lower for k in keywords)
+
+    if keyword_match:
+        return True
+    if msgs_since_update >= int(min_messages_since_update):
+        return True
     return False
 
 async def rag_search(query: str, k: int = 6):
