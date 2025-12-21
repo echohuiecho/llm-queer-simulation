@@ -29,7 +29,16 @@ def get_initial_state() -> Dict[str, Any]:
         "rag_directory": config.get("rag_directory", "default"),
         "outbox": [],  # Events to broadcast via WebSocket
         "turn_context": {},
-        "proposed_actions": {}
+        "proposed_actions": {},
+
+        # --- Webtoon storyline planning (LoopAgent pipeline) ---
+        "current_storyline": {},          # dict form (parsed JSON)
+        "current_storyline_json": "",     # canonical JSON string for prompt injection
+        "storyline_version": 0,
+        "storyline_iteration": 0,
+        "storyline_triggered": False,     # milestone-trigger latch
+        "storyline_review_status": "",    # pass/fail
+        "review_feedback": "",            # reviewer feedback for refiner
     }
 
 def add_to_outbox(state: Dict[str, Any], event: Dict[str, Any]):

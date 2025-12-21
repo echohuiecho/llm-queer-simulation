@@ -3,6 +3,7 @@ from google.adk.agents import LlmAgent, SequentialAgent
 from .personas import create_persona_agent
 from config import config
 from ..tools import dispatch_persona_replies
+from .storyline import create_storyline_pipeline
 
 def create_dispatch_agent() -> LlmAgent:
     """Create a fresh dispatch agent instance to avoid parent agent conflicts."""
@@ -18,7 +19,7 @@ Do not write anything else.
     )
 
 
-def create_root_agent_with_shuffled_order() -> SequentialAgent:
+def create_root_agent_with_shuffled_order(*, enable_storyline: bool = False) -> SequentialAgent:
     """
     Create a root SequentialAgent with persona agents in a random order.
     This ensures each agent sees state updates in a different order each turn.
@@ -27,7 +28,8 @@ def create_root_agent_with_shuffled_order() -> SequentialAgent:
     have one parent. Reusing the same instances would cause a validation error.
 
     Returns:
-        A SequentialAgent with shuffled persona agents + dispatch agent
+        A SequentialAgent with shuffled persona agents + dispatch agent,
+        optionally extended with a LoopAgent storyline refinement pipeline.
     """
     # Create fresh agent instances to avoid "agent already has a parent" error
     profiles = config.get("agent_profiles", {})
@@ -57,15 +59,24 @@ def create_root_agent_with_shuffled_order() -> SequentialAgent:
     # Create a fresh dispatch agent to avoid parent conflicts
     fresh_dispatch_agent = create_dispatch_agent()
 
-    # Create root agent with sequential deciders + dispatch
+    sub_agents = [sequential_deciders, fresh_dispatch_agent]
+
+    # Optional extension: webtoon storyline planning + iterative refinement loop.
+    if enable_storyline:
+        sub_agents.append(create_storyline_pipeline())
+
+    # Create root agent with sequential deciders + dispatch (+ optional storyline pipeline)
     root = SequentialAgent(
         name="QueerSimRoot",
-        sub_agents=[sequential_deciders, fresh_dispatch_agent],
-        description="Sequential persona agents (with shuffled order each turn) + deterministic dispatch"
+        sub_agents=sub_agents,
+        description=(
+            "Sequential persona agents (with shuffled order each turn) + deterministic dispatch"
+            + (" + webtoon storyline planning loop" if enable_storyline else "")
+        ),
     )
 
     return root
 
 
 # Create initial root agent (will be recreated with new order each turn)
-root_agent = create_root_agent_with_shuffled_order()
+root_agent = create_root_agent_with_shuffled_order(enable_storyline=False)

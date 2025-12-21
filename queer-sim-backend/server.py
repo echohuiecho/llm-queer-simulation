@@ -14,7 +14,7 @@ from youtube_ingest import YouTubeIngestManager
 
 # ADK Imports
 from adk_sim.state import get_initial_state
-from adk_sim.tools import set_rag_index
+from adk_sim.tools import set_rag_index, compute_storyline_milestone
 from adk_sim.agents.root import root_agent, create_root_agent_with_shuffled_order
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
@@ -205,16 +205,8 @@ async def run_adk_turn(new_message_text: str):
     This ensures each agent sees state updates in a different order each turn,
     making their responses more varied and natural.
     """
-    # Create a new root agent with shuffled order for this turn
-    # This ensures agents see state updates in different orders each turn
-    shuffled_root_agent = create_root_agent_with_shuffled_order()
-
-    # Create a new runner with the shuffled root agent
-    turn_runner = Runner(
-        agent=shuffled_root_agent,
-        app_name="QueerSim",
-        session_service=session_service
-    )
+    # Note: we create the per-turn root agent AFTER we compute milestone state,
+    # so we can optionally extend the pipeline with the webtoon storyline loop.
 
     async def run_scripted_fallback(note: str | None = None):
         """Scripted fallback so the sim still works if Gemini is unavailable."""
@@ -273,6 +265,38 @@ async def run_adk_turn(new_message_text: str):
                     for m in msgs[-10:]:
                         history_str += f"- {m['from']}: {m['text']}\n"
 
+        # Decide whether to trigger the webtoon storyline planning loop this turn.
+        enable_storyline = False
+        if session_for_summary and session_for_summary.state:
+            tmp_state = dict(session_for_summary.state)
+            tmp_state["new_message"] = new_message_text
+            enable_storyline = compute_storyline_milestone(tmp_state, room="group_chat")
+            print(f"[SERVER] Milestone check result: enable_storyline={enable_storyline}")
+
+        if enable_storyline:
+            print(f"[SERVER] Triggering storyline planning loop")
+            # Latch so we don't trigger repeatedly.
+            await apply_state_delta(
+                {
+                    "storyline_triggered": True,
+                    "storyline_iteration": 0,
+                    "storyline_review_status": "",
+                    "review_feedback": "",
+                },
+                author="user",
+            )
+
+        # Create a new root agent with shuffled order for this turn.
+        # If enable_storyline is True, the root includes the LoopAgent refinement pipeline.
+        shuffled_root_agent = create_root_agent_with_shuffled_order(enable_storyline=enable_storyline)
+
+        # Create a new runner with the per-turn root agent.
+        turn_runner = Runner(
+            agent=shuffled_root_agent,
+            app_name="QueerSim",
+            session_service=session_service,
+        )
+
         profiles = config.get("agent_profiles", {})
         captured_by_author: dict[str, str] = {}
 
@@ -323,7 +347,13 @@ async def run_adk_turn(new_message_text: str):
                     pass
 
         # Guard against model/network hangs: fall back to scripted replies.
-        await asyncio.wait_for(_run(), timeout=20)
+        # Increase timeout when storyline planning is enabled (it takes longer)
+        timeout_seconds = 60 if enable_storyline else 20
+        try:
+            await asyncio.wait_for(_run(), timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            print(f"[RUN_ADK] Turn timed out after {timeout_seconds}s (storyline={enable_storyline})")
+            raise
 
         # ADK tools modify tool_context.state directly, and those changes should be automatically
         # persisted. However, get_session() returns a deep copy, so we need to ensure we're
@@ -649,6 +679,21 @@ async def get_youtube_job(job_id: str):
         "errors": job.errors,
         "results": job.results
     }
+
+@app.post("/api/storyline/reset")
+async def reset_storyline():
+    """Reset storyline trigger flag to allow re-triggering."""
+    session = await session_service.get_session(
+        app_name="QueerSim",
+        user_id=GLOBAL_USER_ID,
+        session_id=GLOBAL_SESSION_ID,
+    )
+    if session:
+        await apply_state_delta(
+            {"storyline_triggered": False},
+            author="user"
+        )
+    return {"status": "ok", "message": "Storyline trigger flag reset"}
 
 @app.post("/api/rag/start-conversation")
 async def start_conversation_with_kb(data: dict):

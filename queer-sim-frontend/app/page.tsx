@@ -11,6 +11,14 @@ type SystemMsg = { type: "system_message"; room: string; text: string; ts: numbe
 type AgentStateMsg = { type: "agent_state"; id: string; name: string; room: RoomId; pos: { x: number; y: number }; ts: number };
 type FrameReferenceMsg = { type: "frame_reference"; agent: string; frame_file: string; timestamp: string; timestamp_seconds: number; caption: string; room: string; ts: number };
 type FrameReference = { frame_file: string; timestamp: string; timestamp_seconds: number; caption: string };
+type StorylineUpdateMsg = {
+  type: "storyline_update";
+  version: number;
+  room?: string;
+  storyline: any;
+  storyline_json: string;
+  ts: number
+};
 
 type StateMsg = {
   type: "state";
@@ -196,6 +204,9 @@ export default function Home() {
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const eventIdCounter = useRef(0);
   const [agentProfiles, setAgentProfiles] = useState<Record<string, {name: string}>>({});
+  const [currentStoryline, setCurrentStoryline] = useState<any>(null);
+  const [storylineVersion, setStorylineVersion] = useState<number>(0);
+  const [showStorylinePanel, setShowStorylinePanel] = useState(false);
 
   useEffect(() => {
     fetch("http://localhost:8000/api/settings")
@@ -326,6 +337,15 @@ export default function Home() {
         });
         return;
       }
+
+      if (data.type === "storyline_update") {
+        const s = data as StorylineUpdateMsg;
+        setCurrentStoryline(s.storyline);
+        setStorylineVersion(s.version);
+        // Auto-open panel when storyline is updated
+        setShowStorylinePanel(true);
+        return;
+      }
     };
 
     ws.onclose = () => {
@@ -401,21 +421,40 @@ export default function Home() {
             <div style={{ fontSize: 13, opacity: 0.5, textTransform: "uppercase", letterSpacing: 1, marginBottom: 4 }}>Current Room</div>
             <div style={{ fontSize: 24, fontWeight: 700 }}>#{activeRoom}</div>
           </div>
-          <Link
-            href="/settings"
-            style={{
-              padding: "8px 16px",
-              borderRadius: 8,
-              background: "rgba(255,255,255,0.05)",
-              color: "white",
-              textDecoration: "none",
-              fontSize: 13,
-              fontWeight: 600,
-              border: "1px solid rgba(255,255,255,0.1)"
-            }}
-          >
-            Settings
-          </Link>
+          <div style={{ display: "flex", gap: 8 }}>
+            {currentStoryline && (
+              <button
+                onClick={() => setShowStorylinePanel(!showStorylinePanel)}
+                style={{
+                  padding: "8px 16px",
+                  borderRadius: 8,
+                  background: showStorylinePanel ? "#4a9eff" : "rgba(255,255,255,0.05)",
+                  color: "white",
+                  border: "1px solid rgba(255,255,255,0.1)",
+                  cursor: "pointer",
+                  fontSize: 13,
+                  fontWeight: 600
+                }}
+              >
+                Webtoon Storyline {storylineVersion > 0 && `(v${storylineVersion})`}
+              </button>
+            )}
+            <Link
+              href="/settings"
+              style={{
+                padding: "8px 16px",
+                borderRadius: 8,
+                background: "rgba(255,255,255,0.05)",
+                color: "white",
+                textDecoration: "none",
+                fontSize: 13,
+                fontWeight: 600,
+                border: "1px solid rgba(255,255,255,0.1)"
+              }}
+            >
+              Settings
+            </Link>
+          </div>
         </div>
 
         <div style={{ flex: 1, overflowY: "auto", padding: "24px" }}>
@@ -650,6 +689,125 @@ export default function Home() {
               >
                 Send
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Storyline Panel */}
+      {showStorylinePanel && currentStoryline && (
+        <div
+          style={{
+            position: "fixed",
+            right: 0,
+            top: 0,
+            bottom: 0,
+            width: 500,
+            background: "rgba(20, 20, 20, 0.95)",
+            backdropFilter: "blur(20px)",
+            borderLeft: "1px solid rgba(255, 255, 255, 0.1)",
+            display: "flex",
+            flexDirection: "column",
+            zIndex: 1000,
+            boxShadow: "-4px 0 20px rgba(0, 0, 0, 0.5)",
+            animation: "slideIn 0.3s ease-out",
+          }}
+        >
+          <div style={{ padding: "20px 24px", borderBottom: "1px solid rgba(255, 255, 255, 0.1)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div>
+              <div style={{ fontSize: 13, opacity: 0.5, textTransform: "uppercase", letterSpacing: 1, marginBottom: 4 }}>Webtoon Storyline</div>
+              <div style={{ fontSize: 20, fontWeight: 700 }}>{currentStoryline.title || "Untitled"} {storylineVersion > 0 && `(v${storylineVersion})`}</div>
+            </div>
+            <button
+              onClick={() => setShowStorylinePanel(false)}
+              style={{
+                padding: "8px 12px",
+                borderRadius: 8,
+                background: "rgba(255,255,255,0.05)",
+                color: "white",
+                border: "1px solid rgba(255,255,255,0.1)",
+                cursor: "pointer",
+                fontSize: 18
+              }}
+            >
+              ×
+            </button>
+          </div>
+          <div style={{ flex: 1, overflowY: "auto", padding: "24px" }}>
+            <div style={{ marginBottom: 24 }}>
+              <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 8, opacity: 0.8 }}>Overview</div>
+              {currentStoryline.overall_theme && (
+                <div style={{ fontSize: 13, lineHeight: 1.6, opacity: 0.9, marginBottom: 12 }}>
+                  <strong>Theme:</strong> {currentStoryline.overall_theme}
+                </div>
+              )}
+              {currentStoryline.target_audience && (
+                <div style={{ fontSize: 13, lineHeight: 1.6, opacity: 0.9 }}>
+                  <strong>Target Audience:</strong> {currentStoryline.target_audience}
+                </div>
+              )}
+            </div>
+
+            {currentStoryline.characters && currentStoryline.characters.length > 0 && (
+              <div style={{ marginBottom: 24 }}>
+                <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 12, opacity: 0.8 }}>Characters</div>
+                {currentStoryline.characters.map((char: any, idx: number) => (
+                  <div key={idx} style={{ marginBottom: 16, padding: 12, background: "rgba(255,255,255,0.03)", borderRadius: 8, border: "1px solid rgba(255,255,255,0.1)" }}>
+                    <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 4 }}>{char.name}</div>
+                    {char.description && (
+                      <div style={{ fontSize: 13, opacity: 0.8, marginBottom: 4 }}>{char.description}</div>
+                    )}
+                    {char.visual_description && (
+                      <div style={{ fontSize: 12, opacity: 0.6, fontStyle: "italic" }}>{char.visual_description}</div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {currentStoryline.scenes && currentStoryline.scenes.length > 0 && (
+              <div style={{ marginBottom: 24 }}>
+                <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 12, opacity: 0.8 }}>Scenes</div>
+                {currentStoryline.scenes.map((scene: any, idx: number) => (
+                  <div key={idx} style={{ marginBottom: 20, padding: 16, background: "rgba(255,255,255,0.03)", borderRadius: 8, border: "1px solid rgba(255,255,255,0.1)" }}>
+                    <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 8 }}>
+                      Episode {scene.episode || "?"}, Scene {scene.scene_number || idx + 1}
+                    </div>
+                    {scene.summary && (
+                      <div style={{ fontSize: 13, opacity: 0.8, marginBottom: 12, lineHeight: 1.5 }}>{scene.summary}</div>
+                    )}
+                    {scene.panels && scene.panels.length > 0 && (
+                      <div style={{ marginTop: 12 }}>
+                        {scene.panels.map((panel: any, pIdx: number) => (
+                          <div key={pIdx} style={{ marginBottom: 12, padding: 10, background: "rgba(0,0,0,0.2)", borderRadius: 6 }}>
+                            <div style={{ fontSize: 11, opacity: 0.6, marginBottom: 6 }}>Panel {panel.panel_number || pIdx + 1}</div>
+                            {panel.visual_description && (
+                              <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6, fontStyle: "italic" }}>
+                                {panel.visual_description}
+                              </div>
+                            )}
+                            {panel.dialogue && (
+                              <div style={{ fontSize: 12, opacity: 0.9, marginBottom: 4 }}>
+                                <strong>Dialogue:</strong> {panel.dialogue}
+                              </div>
+                            )}
+                            {panel.mood && (
+                              <div style={{ fontSize: 11, opacity: 0.6 }}>Mood: {panel.mood}</div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div style={{ marginTop: 24, padding: 16, background: "rgba(74, 158, 255, 0.1)", borderRadius: 8, border: "1px solid rgba(74, 158, 255, 0.2)" }}>
+              <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8, opacity: 0.8 }}>Raw JSON</div>
+              <pre style={{ fontSize: 11, opacity: 0.7, overflow: "auto", maxHeight: 300, margin: 0 }}>
+                {JSON.stringify(currentStoryline, null, 2)}
+              </pre>
             </div>
           </div>
         </div>

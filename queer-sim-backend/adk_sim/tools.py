@@ -1,5 +1,6 @@
 import time
 import random
+import json
 from typing import Any, Dict, List, Optional
 from google.adk.tools.tool_context import ToolContext
 from .state import add_message, add_dm, update_agent_pos, add_to_outbox
@@ -76,6 +77,247 @@ def wait(minutes: int, tool_context: ToolContext):
     """Do nothing for a while. Use this when you want to observe or wait before taking action."""
     # In a real-time simulation, we don't actually wait, but we can log this action
     return {"status": "waited", "minutes": minutes, "message": f"Waited {minutes} minutes"}
+
+def plan_storyline(
+    storyline_json: str,
+    room: str = "group_chat",
+    *,
+    tool_context: ToolContext,
+) -> Dict[str, Any]:
+    """Store an initial webtoon storyline draft into session state.
+
+    The planner agent should generate a JSON string for the storyline and call this tool.
+    We validate it's parseable JSON and store it under state['current_storyline'].
+    """
+    print(f"[PLAN_STORYLINE] Called with JSON length: {len(storyline_json)}")
+    state = tool_context.state
+    try:
+        parsed = json.loads(storyline_json)
+    except Exception as e:
+        state["review_feedback"] = f"Invalid JSON: {e}"
+        state["storyline_review_status"] = "fail"
+        return {"result": "fail", "message": f"Invalid JSON: {e}"}
+
+    if not isinstance(parsed, dict):
+        state["review_feedback"] = "Storyline must be a JSON object at the top level."
+        state["storyline_review_status"] = "fail"
+        return {"result": "fail", "message": "Storyline must be a JSON object at the top level."}
+
+    version = int(state.get("storyline_version") or 0) + 1
+    parsed.setdefault("meta", {})
+    if isinstance(parsed.get("meta"), dict):
+        parsed["meta"]["version"] = version
+        parsed["meta"]["updated_ts"] = time.time()
+
+    state["current_storyline"] = parsed
+    state["current_storyline_json"] = json.dumps(parsed, ensure_ascii=False)
+    state["storyline_version"] = version
+    state["storyline_iteration"] = 0
+
+    # Emit a machine-readable event with full storyline JSON for UI display
+    add_to_outbox(state, {
+        "type": "storyline_update",
+        "version": version,
+        "room": room,
+        "storyline": parsed,  # Include full structured JSON
+        "storyline_json": state["current_storyline_json"],  # Also include string version
+        "ts": time.time()
+    })
+    # Minimal human-visible message (keeps UI contract unchanged)
+    add_message(state, room, "System", f"Storyline draft created (v{version}).")
+
+    print(f"[PLAN_STORYLINE] Successfully created storyline v{version} with {len(parsed.get('scenes', []))} scenes")
+
+    return {"result": "ok", "version": version}
+
+
+def review_storyline(
+    storyline_json: str,
+    *,
+    tool_context: ToolContext,
+) -> Dict[str, Any]:
+    """Deterministically review a storyline JSON draft for basic quality gates.
+
+    This tool is intended to be called by a reviewer agent which decides whether to
+    call exit_loop after reading the tool result.
+    """
+    print(f"[REVIEW_STORYLINE] Called with JSON length: {len(storyline_json)}")
+    state = tool_context.state
+    try:
+        parsed = json.loads(storyline_json)
+    except Exception as e:
+        feedback = f"Invalid JSON: {e}"
+        state["review_feedback"] = feedback
+        state["storyline_review_status"] = "fail"
+        return {"result": "fail", "feedback": feedback}
+
+    issues: list[str] = []
+    if not isinstance(parsed, dict):
+        issues.append("Top-level must be an object.")
+    else:
+        chars = parsed.get("characters")
+        if not isinstance(chars, list) or len(chars) != 2:
+            issues.append("`characters` must be a list of exactly 2 characters (two masc lesbians).")
+        else:
+            for i, c in enumerate(chars):
+                if not isinstance(c, dict):
+                    issues.append(f"characters[{i}] must be an object.")
+                    continue
+                if not (c.get("name") and isinstance(c.get("name"), str)):
+                    issues.append(f"characters[{i}].name must be a string.")
+                if not (c.get("description") and isinstance(c.get("description"), str)):
+                    issues.append(f"characters[{i}].description must be a string.")
+                if not (c.get("visual_description") and isinstance(c.get("visual_description"), str)):
+                    issues.append(f"characters[{i}].visual_description must be a string.")
+
+        scenes = parsed.get("scenes")
+        if not isinstance(scenes, list) or len(scenes) < 1:
+            issues.append("`scenes` must be a non-empty list.")
+        else:
+            # Validate first few scenes/panels for webtoon-friendly vertical stack format
+            for si, s in enumerate(scenes[:5]):
+                if not isinstance(s, dict):
+                    issues.append(f"scenes[{si}] must be an object.")
+                    continue
+                panels = s.get("panels")
+                if not isinstance(panels, list) or len(panels) < 3:
+                    issues.append(f"scenes[{si}].panels must have at least 3 panels (vertical scroll feel).")
+                else:
+                    for pi, p in enumerate(panels[:5]):
+                        if not isinstance(p, dict):
+                            issues.append(f"scenes[{si}].panels[{pi}] must be an object.")
+                            continue
+                        if not (p.get("visual_description") and isinstance(p.get("visual_description"), str)):
+                            issues.append(f"scenes[{si}].panels[{pi}].visual_description must be a string.")
+                        if not (p.get("dialogue") and isinstance(p.get("dialogue"), str)):
+                            issues.append(f"scenes[{si}].panels[{pi}].dialogue must be a string.")
+
+    if issues:
+        feedback = "Needs work:\n- " + "\n- ".join(issues)
+        state["review_feedback"] = feedback
+        state["storyline_review_status"] = "fail"
+        return {"result": "fail", "feedback": feedback, "issues": issues}
+
+    feedback = "Passes basic structural quality checks."
+    state["review_feedback"] = feedback
+    state["storyline_review_status"] = "pass"
+    return {"result": "pass", "feedback": feedback}
+
+
+def refine_storyline(
+    storyline_json: str,
+    *,
+    tool_context: ToolContext,
+) -> Dict[str, Any]:
+    """Store a refined storyline JSON draft into session state."""
+    print(f"[REFINE_STORYLINE] Called with JSON length: {len(storyline_json)}")
+    state = tool_context.state
+    try:
+        parsed = json.loads(storyline_json)
+    except Exception as e:
+        state["review_feedback"] = f"Invalid JSON: {e}"
+        state["storyline_review_status"] = "fail"
+        return {"result": "fail", "message": f"Invalid JSON: {e}"}
+
+    if not isinstance(parsed, dict):
+        state["review_feedback"] = "Storyline must be a JSON object at the top level."
+        state["storyline_review_status"] = "fail"
+        return {"result": "fail", "message": "Storyline must be a JSON object at the top level."}
+
+    version = int(state.get("storyline_version") or 0) + 1
+    parsed.setdefault("meta", {})
+    if isinstance(parsed.get("meta"), dict):
+        parsed["meta"]["version"] = version
+        parsed["meta"]["updated_ts"] = time.time()
+
+    state["current_storyline"] = parsed
+    state["current_storyline_json"] = json.dumps(parsed, ensure_ascii=False)
+    state["storyline_version"] = version
+    state["storyline_iteration"] = int(state.get("storyline_iteration") or 0) + 1
+
+    # Emit storyline update with full JSON
+    add_to_outbox(state, {
+        "type": "storyline_update",
+        "version": version,
+        "storyline": state.get("current_storyline", {}),
+        "storyline_json": state.get("current_storyline_json", "{}"),
+        "ts": time.time()
+    })
+    return {"result": "ok", "version": version, "iteration": state["storyline_iteration"]}
+
+
+def exit_loop(*, tool_context: ToolContext) -> Dict[str, Any]:
+    """Signal to a LoopAgent that it should stop iterating."""
+    state = tool_context.state
+    tool_context.actions.escalate = True
+
+    # Emit a visible event that the storyline has reached a stopping point.
+    version = state.get("storyline_version")
+    add_message(state, "group_chat", "System", f"Storyline refinement complete (v{version}).")
+    return {}
+
+
+def compute_storyline_milestone(
+    state: Dict[str, Any],
+    *,
+    room: str = "group_chat",
+    min_messages: int = 12,
+) -> bool:
+    """Pure helper: decide whether to auto-trigger storyline planning.
+
+    Heuristics:
+    - Only trigger once per session (state['storyline_triggered']).
+    - Trigger if enough chat messages have accumulated OR explicit keywords show up.
+    """
+    already_triggered = state.get("storyline_triggered", False)
+    current_storyline = state.get("current_storyline", {})
+    storyline_version = state.get("storyline_version", 0)
+
+    # Allow re-triggering if storyline was triggered but never actually created
+    if already_triggered:
+        if not current_storyline or storyline_version == 0:
+            print(f"[MILESTONE] Storyline was triggered but never created, allowing re-trigger")
+            # Reset the flag to allow re-triggering
+            state["storyline_triggered"] = False
+        else:
+            print(f"[MILESTONE] Storyline already triggered and exists (v{storyline_version}), skipping")
+            return False
+
+    history = (state.get("history") or {}).get(room) or []
+    history_count = len(history)
+    print(f"[MILESTONE] Checking milestone: history_count={history_count}, min_messages={min_messages}, room={room}")
+
+    if history_count >= min_messages:
+        print(f"[MILESTONE] Milestone reached: {history_count} messages >= {min_messages}")
+        return True
+
+    keywords = [
+        "webtoon",
+        "웹툰",
+        "comic",
+        "manhwa",
+        "스토리",
+        "storyline",
+        "two masc lesbian",
+        "masc lesbian",
+    ]
+
+    # Check the latest user message if present, otherwise scan last few messages.
+    latest = state.get("new_message") or ""
+    text_blob = str(latest)
+    if not text_blob and history:
+        tail = history[-6:]
+        text_blob = " ".join(str(m.get("text", "")) for m in tail if isinstance(m, dict))
+
+    text_lower = text_blob.lower()
+    keyword_match = any(k.lower() in text_lower for k in keywords)
+    if keyword_match:
+        matched_keywords = [k for k in keywords if k.lower() in text_lower]
+        print(f"[MILESTONE] Keyword match found: {matched_keywords}")
+        return True
+
+    print(f"[MILESTONE] No milestone reached: history_count={history_count}, keyword_match={keyword_match}")
+    return False
 
 async def rag_search(query: str, k: int = 6):
     """Search the show subtitles and frames for relevant content."""

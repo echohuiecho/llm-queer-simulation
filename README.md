@@ -137,39 +137,52 @@ The simulation supports using external documents to inform agent conversations.
 
 The simulation uses **Google ADK** for agent orchestration with a dynamic sequential multi-agent architecture:
 
-### Agent Pipeline
+### Webtoon Storyline Planning Loop Integration
 
 ```mermaid
 graph TD
     User[User Message] --> Root[SequentialAgent: QueerSimRoot]
 
-    Root --> SequentialDeciders[SequentialAgent: SequentialDeciders<br/>Shuffled Order Each Turn]
+    Root --> SequentialDeciders[SequentialAgent: SequentialDeciders<br/>Shuffled Order]
+    SequentialDeciders --> A1[Persona Agent a1]
+    A1 --> A2[Persona Agent a2]
+    A2 --> A3[Persona Agent a3]
 
-    SequentialDeciders --> A1[Persona Agent a1<br/>Noor K.]
-    A1 --> A2[Persona Agent a2<br/>Ji-woo]
-    A2 --> A3[Persona Agent a3<br/>Mika Tan]
+    A1 --> Conversation[Conversation History]
+    A2 --> Conversation
+    A3 --> Conversation
 
-    Note1[Note: Agent order is shuffled<br/>each turn e.g. a2→a1→a3]
+    Conversation --> MilestoneCheck{Conversation<br/>Milestone?}
 
-    A1 --> Tools1[Tools:<br/>- send_message<br/>- send_dm<br/>- move_room<br/>- wait<br/>- retrieve_scene<br/>- prepare_turn_context]
-    A2 --> Tools2[Tools:<br/>- send_message<br/>- send_dm<br/>- move_room<br/>- wait<br/>- retrieve_scene<br/>- prepare_turn_context]
-    A3 --> Tools3[Tools:<br/>- send_message<br/>- send_dm<br/>- move_room<br/>- wait<br/>- retrieve_scene<br/>- prepare_turn_context]
+    MilestoneCheck -->|Yes| StorylineLoop[LoopAgent: StorylinePlanningLoop]
+    MilestoneCheck -->|No| Dispatch[DispatchAgent]
 
-    Tools1 --> State[ADK Session State]
-    Tools2 --> State
-    Tools3 --> State
+    StorylineLoop --> Planner[StorylinePlanner Agent]
+    Planner --> RAG[RAG Context]
+    Planner --> Conversation
+    Planner --> StorylineState[current_storyline]
 
-    State --> Dispatch[DispatchAgent]
+    StorylineLoop --> Reviewer[StorylineReviewer Agent]
+    Reviewer --> ReviewTools[Tools:<br/>- review_storyline<br/>- exit_loop]
+    Reviewer --> StorylineState
+
+    StorylineLoop --> Refiner[StorylineRefiner Agent]
+    Refiner --> Feedback[review_feedback]
+    Refiner --> StorylineState
+
+    Reviewer -->|Quality Met| ExitLoop[Exit Loop]
+    Reviewer -->|Needs Work| Refiner
+
+    StorylineState --> Dispatch
     Dispatch --> Outbox[Outbox Events]
     Outbox --> WS[WebSocket Broadcast]
 
     style Root fill:#e1f5ff
-    style SequentialDeciders fill:#d1e5ff
-    style A1 fill:#ffe1f5
-    style A2 fill:#f5ffe1
-    style A3 fill:#fff5e1
-    style State fill:#f0f0f0
-    style Dispatch fill:#e1ffe1
+    style StorylineLoop fill:#ffe1f5
+    style Planner fill:#f5ffe1
+    style Reviewer fill:#fff5e1
+    style Refiner fill:#e1fff5
+    style StorylineState fill:#f0f0f0
 ```
 
 ### Key Features
