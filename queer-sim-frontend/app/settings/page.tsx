@@ -8,6 +8,12 @@ import FileUpload from "../../components/FileUpload";
 interface AgentProfile {
   name: string;
   persona: string;
+  name_en?: string;
+  name_zh_Hans?: string;
+  name_zh_Hant?: string;
+  persona_en?: string;
+  persona_zh_Hans?: string;
+  persona_zh_Hant?: string;
 }
 
 interface InitialMessage {
@@ -23,6 +29,13 @@ interface Settings {
   system_prompt: string;
   initial_messages: InitialMessage[];
   rag_directory: string;
+  language?: string;
+  system_prompt_en?: string;
+  system_prompt_zh_Hans?: string;
+  system_prompt_zh_Hant?: string;
+  initial_messages_en?: InitialMessage[];
+  initial_messages_zh_Hans?: InitialMessage[];
+  initial_messages_zh_Hant?: InitialMessage[];
 }
 
 export default function SettingsPage() {
@@ -36,6 +49,7 @@ export default function SettingsPage() {
   const [youtubeUrls, setYoutubeUrls] = useState("");
   const [youtubeJobId, setYoutubeJobId] = useState<string | null>(null);
   const [youtubeJobStatus, setYoutubeJobStatus] = useState<any>(null);
+  const [currentLanguage, setCurrentLanguage] = useState<string>("en");
 
   useEffect(() => {
     fetchSettings();
@@ -97,7 +111,65 @@ export default function SettingsPage() {
     try {
       const response = await fetch("http://localhost:8000/api/settings");
       const data = await response.json();
+
+      // Migration: Convert old format to language-specific format if needed
+      if (data.system_prompt && (!data.system_prompt_en && !data.system_prompt_zh_Hans && !data.system_prompt_zh_Hant)) {
+        data.system_prompt_en = data.system_prompt;
+        data.system_prompt_zh_Hans = data.system_prompt_zh_Hans || "";
+        data.system_prompt_zh_Hant = data.system_prompt_zh_Hant || "";
+      }
+      if (data.initial_messages && (!data.initial_messages_en && !data.initial_messages_zh_Hans && !data.initial_messages_zh_Hant)) {
+        data.initial_messages_en = data.initial_messages;
+        data.initial_messages_zh_Hans = data.initial_messages_zh_Hans || [];
+        data.initial_messages_zh_Hant = data.initial_messages_zh_Hant || [];
+      }
+
+      // Set default language if not specified
+      if (!data.language) {
+        data.language = "en";
+      }
+
+      // Normalize language code
+      const normalizedLang = (data.language || "en").replace(/-/g, "_");
+      data.language = normalizedLang;
+
+      // Load current language's data into display fields
+      const langKeyPrompt = `system_prompt_${normalizedLang}` as keyof Settings;
+      const langKeyMessages = `initial_messages_${normalizedLang}` as keyof Settings;
+
+      if (data[langKeyPrompt] !== undefined) {
+        data.system_prompt = data[langKeyPrompt] as string;
+      }
+      if (data[langKeyMessages] !== undefined) {
+        data.initial_messages = data[langKeyMessages] as InitialMessage[];
+      }
+
+      // Load agent profiles for current language
+      if (data.agent_profiles) {
+        for (const agentId in data.agent_profiles) {
+          const profile = data.agent_profiles[agentId];
+          const langKeyName = `name_${normalizedLang}` as keyof AgentProfile;
+          const langKeyPersona = `persona_${normalizedLang}` as keyof AgentProfile;
+
+          const langName = (profile[langKeyName] as string | undefined);
+          const langPersona = (profile[langKeyPersona] as string | undefined);
+
+          if (langName !== undefined) {
+            profile.name = langName;
+          } else if (normalizedLang !== "en" && profile.name_en) {
+            profile.name = profile.name_en;
+          }
+
+          if (langPersona !== undefined) {
+            profile.persona = langPersona;
+          } else if (normalizedLang !== "en" && profile.persona_en) {
+            profile.persona = profile.persona_en;
+          }
+        }
+      }
+
       setSettings(data);
+      setCurrentLanguage(normalizedLang);
     } catch (error) {
       console.error("Failed to fetch settings:", error);
     } finally {
@@ -119,16 +191,22 @@ export default function SettingsPage() {
     if (!settings) return;
     setSaveStatus("Saving...");
     try {
+      // Ensure language field is set
+      const settingsToSave = {
+        ...settings,
+        language: currentLanguage,
+      };
+
       const response = await fetch("http://localhost:8000/api/settings", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(settings),
+        body: JSON.stringify(settingsToSave),
       });
       if (response.ok) {
         setSaveStatus("Settings saved!");
         setTimeout(() => setSaveStatus(null), 3000);
         // Persistence to localStorage as well
-        localStorage.setItem("queer_sim_settings", JSON.stringify(settings));
+        localStorage.setItem("queer_sim_settings", JSON.stringify(settingsToSave));
       } else {
         setSaveStatus("Failed to save settings");
       }
@@ -137,24 +215,90 @@ export default function SettingsPage() {
     }
   };
 
+  const handleLanguageChange = (lang: string) => {
+    if (!settings) return;
+
+    // Normalize language code (convert zh-Hans/zh-Hant to zh_Hans/zh_Hant for consistency)
+    const normalizedLang = lang.replace(/-/g, "_");
+    const normalizedCurrentLang = currentLanguage.replace(/-/g, "_");
+
+    // Save current language's data before switching
+    const langKeyPrompt = `system_prompt_${normalizedCurrentLang}` as keyof Settings;
+    const langKeyMessages = `initial_messages_${normalizedCurrentLang}` as keyof Settings;
+
+    const updatedSettings: Settings = {
+      ...settings,
+      [langKeyPrompt]: settings.system_prompt,
+      [langKeyMessages]: settings.initial_messages,
+      language: normalizedLang,
+    };
+
+    // Load new language's data
+    const newLangKeyPrompt = `system_prompt_${normalizedLang}` as keyof Settings;
+    const newLangKeyMessages = `initial_messages_${normalizedLang}` as keyof Settings;
+
+    const newPrompt = (updatedSettings[newLangKeyPrompt] as string | undefined);
+    const newMessages = (updatedSettings[newLangKeyMessages] as InitialMessage[] | undefined);
+
+    updatedSettings.system_prompt = newPrompt !== undefined ? newPrompt : "";
+    updatedSettings.initial_messages = newMessages !== undefined ? newMessages : [];
+
+    // Update agent profiles for new language
+    if (updatedSettings.agent_profiles) {
+      for (const agentId in updatedSettings.agent_profiles) {
+        const profile = updatedSettings.agent_profiles[agentId];
+        const newLangKeyName = `name_${normalizedLang}` as keyof AgentProfile;
+        const newLangKeyPersona = `persona_${normalizedLang}` as keyof AgentProfile;
+
+        const newName = (profile[newLangKeyName] as string | undefined);
+        const newPersona = (profile[newLangKeyPersona] as string | undefined);
+
+        if (newName !== undefined) {
+          profile.name = newName;
+        } else if (normalizedLang !== "en" && profile.name_en) {
+          profile.name = profile.name_en;
+        }
+
+        if (newPersona !== undefined) {
+          profile.persona = newPersona;
+        } else if (normalizedLang !== "en" && profile.persona_en) {
+          profile.persona = profile.persona_en;
+        }
+      }
+    }
+
+    setSettings(updatedSettings);
+    setCurrentLanguage(normalizedLang);
+  };
+
   const updateAgentName = (id: string, name: string) => {
     if (!settings) return;
+    const langKeyName = `name_${currentLanguage}` as keyof AgentProfile;
     setSettings({
       ...settings,
       agent_profiles: {
         ...settings.agent_profiles,
-        [id]: { ...settings.agent_profiles[id], name },
+        [id]: {
+          ...settings.agent_profiles[id],
+          name,
+          [langKeyName]: name
+        },
       },
     });
   };
 
   const updateAgentPersona = (id: string, persona: string) => {
     if (!settings) return;
+    const langKeyPersona = `persona_${currentLanguage}` as keyof AgentProfile;
     setSettings({
       ...settings,
       agent_profiles: {
         ...settings.agent_profiles,
-        [id]: { ...settings.agent_profiles[id], persona },
+        [id]: {
+          ...settings.agent_profiles[id],
+          persona,
+          [langKeyPersona]: persona
+        },
       },
     });
   };
@@ -163,21 +307,34 @@ export default function SettingsPage() {
     if (!settings) return;
     const newMessages = [...settings.initial_messages];
     newMessages[index] = { ...newMessages[index], [field]: value };
-    setSettings({ ...settings, initial_messages: newMessages });
+    const langKeyMessages = `initial_messages_${currentLanguage}` as keyof Settings;
+    setSettings({
+      ...settings,
+      initial_messages: newMessages,
+      [langKeyMessages]: newMessages
+    });
   };
 
   const addInitialMessage = () => {
     if (!settings) return;
+    const newMessages = [...settings.initial_messages, { sender: "", text: "" }];
+    const langKeyMessages = `initial_messages_${currentLanguage}` as keyof Settings;
     setSettings({
       ...settings,
-      initial_messages: [...settings.initial_messages, { sender: "", text: "" }],
+      initial_messages: newMessages,
+      [langKeyMessages]: newMessages
     });
   };
 
   const removeInitialMessage = (index: number) => {
     if (!settings) return;
     const newMessages = settings.initial_messages.filter((_, i) => i !== index);
-    setSettings({ ...settings, initial_messages: newMessages });
+    const langKeyMessages = `initial_messages_${currentLanguage}` as keyof Settings;
+    setSettings({
+      ...settings,
+      initial_messages: newMessages,
+      [langKeyMessages]: newMessages
+    });
   };
 
   const createRagDir = async () => {
@@ -286,9 +443,37 @@ export default function SettingsPage() {
           </div>
         </div>
 
+        {/* Language Selection Section */}
+        <section style={{ marginBottom: 48 }}>
+          <h2 style={{ fontSize: 20, fontWeight: 600, marginBottom: 20, opacity: 0.8 }}>Language</h2>
+          <div style={{ padding: 20, borderRadius: 16, background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.05)" }}>
+            <label style={{ display: "block", fontSize: 12, opacity: 0.5, marginBottom: 8 }}>Select Language</label>
+            <select
+              value={currentLanguage}
+              onChange={(e) => handleLanguageChange(e.target.value)}
+              style={{
+                width: "100%",
+                padding: 10,
+                background: "#111",
+                border: "1px solid rgba(255,255,255,0.1)",
+                borderRadius: 8,
+                color: "white",
+                fontSize: 14
+              }}
+            >
+              <option value="en">English</option>
+              <option value="zh_Hans">中文 (简体) / Chinese (Simplified)</option>
+              <option value="zh_Hant">中文 (繁體) / Chinese (Traditional)</option>
+            </select>
+            <div style={{ marginTop: 12, fontSize: 12, opacity: 0.6 }}>
+              Current language: {currentLanguage === "en" ? "English" : currentLanguage === "zh_Hans" ? "中文 (简体)" : "中文 (繁體)"}
+            </div>
+          </div>
+        </section>
+
         {/* Characters Section */}
         <section style={{ marginBottom: 48 }}>
-          <h2 style={{ fontSize: 20, fontWeight: 600, marginBottom: 20, opacity: 0.8 }}>Character Configuration</h2>
+          <h2 style={{ fontSize: 20, fontWeight: 600, marginBottom: 20, opacity: 0.8 }}>Character Configuration ({currentLanguage === "en" ? "English" : currentLanguage === "zh_Hans" ? "中文 (简体)" : "中文 (繁體)"})</h2>
           {Object.entries(settings.agent_profiles).map(([id, profile]) => (
             <div key={id} style={{ marginBottom: 24, padding: 20, borderRadius: 16, background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.05)" }}>
               <div style={{ marginBottom: 16 }}>
@@ -314,10 +499,17 @@ export default function SettingsPage() {
 
         {/* System Prompt Section */}
         <section style={{ marginBottom: 48 }}>
-          <h2 style={{ fontSize: 20, fontWeight: 600, marginBottom: 20, opacity: 0.8 }}>System Prompt</h2>
+          <h2 style={{ fontSize: 20, fontWeight: 600, marginBottom: 20, opacity: 0.8 }}>System Prompt ({currentLanguage === "en" ? "English" : currentLanguage === "zh_Hans" ? "中文 (简体)" : "中文 (繁體)"})</h2>
           <textarea
             value={settings.system_prompt}
-            onChange={(e) => setSettings({ ...settings, system_prompt: e.target.value })}
+            onChange={(e) => {
+              const langKeyPrompt = `system_prompt_${currentLanguage}` as keyof Settings;
+              setSettings({
+                ...settings,
+                system_prompt: e.target.value,
+                [langKeyPrompt]: e.target.value
+              });
+            }}
             rows={6}
             style={{ width: "100%", padding: 20, background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 16, color: "white", fontSize: 14, lineHeight: 1.6 }}
           />
@@ -326,7 +518,7 @@ export default function SettingsPage() {
         {/* Initial Messages Section */}
         <section style={{ marginBottom: 48 }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
-            <h2 style={{ fontSize: 20, fontWeight: 600, opacity: 0.8 }}>Initial Messages</h2>
+            <h2 style={{ fontSize: 20, fontWeight: 600, opacity: 0.8 }}>Initial Messages ({currentLanguage === "en" ? "English" : currentLanguage === "zh_Hans" ? "中文 (简体)" : "中文 (繁體)"})</h2>
             <button
               onClick={addInitialMessage}
               style={{ background: "none", border: "1px solid #4a9eff", color: "#4a9eff", borderRadius: 6, padding: "4px 12px", fontSize: 12, cursor: "pointer" }}

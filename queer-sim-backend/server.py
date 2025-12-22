@@ -100,7 +100,7 @@ async def seed_initial_chat():
     This ensures that config changes are reflected when the server restarts or when
     the RAG directory is changed.
     """
-    initial_messages = config.get("initial_messages", [])
+    initial_messages = config.get_initial_messages()
     from adk_sim.state import add_message
 
     # Get current session state

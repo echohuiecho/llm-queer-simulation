@@ -102,7 +102,7 @@ class Agent:
 
         recent_text = "\n".join([f'{m["from"]}: {m["text"]}' for m in recent_chat[-12:]])
 
-        system = config.get("system_prompt")
+        system = config.get_system_prompt()
 
         rooms_info = ""
         if available_rooms:
