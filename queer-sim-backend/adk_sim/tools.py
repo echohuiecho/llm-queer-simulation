@@ -216,7 +216,11 @@ def refine_storyline(
     *,
     tool_context: ToolContext,
 ) -> Dict[str, Any]:
-    """Store a refined storyline JSON draft into session state."""
+    """Store a refined storyline JSON draft into session state.
+
+    IMPORTANT: This tool preserves all scenes from completed episodes and the current episode.
+    It merges the refined JSON with existing scenes to prevent accidental deletion.
+    """
     print(f"[REFINE_STORYLINE] Called with JSON length: {len(storyline_json)}")
     state = tool_context.state
     try:
@@ -231,11 +235,92 @@ def refine_storyline(
         state["storyline_review_status"] = "fail"
         return {"result": "fail", "message": "Storyline must be a JSON object at the top level."}
 
+    # CRITICAL: Preserve ALL existing scenes to prevent deletion when LLM omits them
+    existing = state.get("current_storyline")
+    if isinstance(existing, dict):
+        existing_scenes = existing.get("scenes")
+        if isinstance(existing_scenes, list):
+            # Identify completed episodes (these should NEVER be modified)
+            meta = existing.get("meta", {})
+            episodes_meta = meta.get("episodes", {}) if isinstance(meta, dict) else {}
+            completed_episodes = set()
+            if isinstance(episodes_meta, dict):
+                for ep_key, ep_info in episodes_meta.items():
+                    if isinstance(ep_info, dict) and ep_info.get("complete") is True:
+                        try:
+                            completed_episodes.add(int(ep_key))
+                        except Exception:
+                            pass
+
+            # Get current episode number
+            current_ep = int(state.get("current_episode_number") or 1)
+
+            # CRITICAL: Preserve ALL existing scenes, not just completed/current
+            # This ensures no scenes are lost if the LLM's refined JSON omits them
+            existing_scene_map = {}
+            for s in existing_scenes:
+                if isinstance(s, dict):
+                    ep = int(s.get("episode") or 0)
+                    sn = int(s.get("scene_number") or 0)
+                    key = (ep, sn)
+                    existing_scene_map[key] = s
+
+            # Merge: add new/refined scenes from parsed, but keep ALL existing scenes
+            new_scenes = parsed.get("scenes", [])
+            if isinstance(new_scenes, list):
+                # Create a map of (episode, scene_number) -> scene for new scenes
+                new_scene_map = {}
+                for s in new_scenes:
+                    if isinstance(s, dict):
+                        ep = int(s.get("episode") or 0)
+                        sn = int(s.get("scene_number") or 0)
+                        key = (ep, sn)
+                        # Only allow new scenes for non-completed episodes
+                        if ep not in completed_episodes:
+                            new_scene_map[key] = s
+
+                # Build final scenes list: start with ALL existing scenes, then merge in new/refined
+                final_scenes = []
+                seen_keys = set()
+
+                # First pass: Add all existing scenes (preserving everything)
+                for key, existing_scene in existing_scene_map.items():
+                    ep, sn = key
+                    seen_keys.add(key)
+                    # If there's a refined version for this scene (and it's not a completed episode), use it
+                    if ep not in completed_episodes and key in new_scene_map:
+                        final_scenes.append(new_scene_map[key])
+                    else:
+                        # Keep the existing scene (especially important for completed episodes)
+                        final_scenes.append(existing_scene)
+
+                # Second pass: Add any completely new scenes that weren't in existing list
+                for s in new_scenes:
+                    if isinstance(s, dict):
+                        ep = int(s.get("episode") or 0)
+                        sn = int(s.get("scene_number") or 0)
+                        key = (ep, sn)
+                        if key not in seen_keys and ep not in completed_episodes:
+                            final_scenes.append(s)
+                            seen_keys.add(key)
+
+                # Sort by episode, then scene_number
+                final_scenes.sort(key=lambda s: (int(s.get("episode") or 0), int(s.get("scene_number") or 0)))
+                parsed["scenes"] = final_scenes
+                print(f"[REFINE_STORYLINE] Preserved {len(existing_scene_map)} existing scenes (including {len(completed_episodes)} completed episodes), merged with {len(new_scenes)} new/refined scenes")
+
     version = int(state.get("storyline_version") or 0) + 1
     parsed.setdefault("meta", {})
     if isinstance(parsed.get("meta"), dict):
         parsed["meta"]["version"] = version
         parsed["meta"]["updated_ts"] = time.time()
+        # Preserve existing episode completion metadata
+        if isinstance(existing, dict):
+            existing_meta = existing.get("meta", {})
+            if isinstance(existing_meta, dict):
+                existing_episodes = existing_meta.get("episodes", {})
+                if isinstance(existing_episodes, dict):
+                    parsed["meta"]["episodes"] = existing_episodes
 
     state["current_storyline"] = parsed
     state["current_storyline_json"] = json.dumps(parsed, ensure_ascii=False)
@@ -303,9 +388,9 @@ def _emit_storyline_update(state: Dict[str, Any], *, room: str = "group_chat"):
     )
 
 def add_scene_to_episode(
-    episode_number: Optional[int] = None,
     scene_summary: str,
     panels: List[Dict[str, Any]],
+    episode_number: Optional[int] = None,
     room: str = "group_chat",
     *,
     tool_context: ToolContext,
@@ -387,9 +472,9 @@ def add_scene_to_episode(
     return {"result": "ok", "version": version, "episode": int(episode_number), "scene_number": int(new_scene_number)}
 
 def refine_scene(
-    episode_number: int,
     scene_number: int,
     refinements: Dict[str, Any],
+    episode_number: Optional[int] = None,
     room: str = "group_chat",
     *,
     tool_context: ToolContext,
@@ -399,6 +484,13 @@ def refine_scene(
     cur = state.get("current_storyline")
     if not isinstance(cur, dict) or not cur:
         return {"result": "fail", "message": "No current_storyline exists yet."}
+
+    # Default to current episode if not specified
+    if episode_number is None:
+        try:
+            episode_number = int(state.get("current_episode_number") or 1)
+        except Exception:
+            episode_number = 1
 
     # Prevent refining completed episodes
     meta = cur.get("meta") if isinstance(cur.get("meta"), dict) else {}

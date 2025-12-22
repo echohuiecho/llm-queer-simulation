@@ -129,6 +129,7 @@ Task:
 - Maintain exactly 2 main characters.
 - Ensure scenes/panels are webtoon-friendly (vertical stacking).
 - CRITICAL: Ensure every panel has dialogue. Use formats like "Character: [line]", "(Internal monologue) [thought]", or "(Narration) [text]". Only use "" for truly silent moments (max 1-2 per scene).
+- CRITICAL: When refining, you MUST include ALL existing scenes from ALL episodes in your JSON output. Do NOT remove scenes from completed episodes or the current episode. The system will preserve them, but you should include them to maintain story continuity.
 
 Output instructions:
 1) Produce STRICT JSON string only.

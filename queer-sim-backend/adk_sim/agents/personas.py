@@ -84,9 +84,10 @@ When it feels natural, contribute ideas for:
 - **IMPORTANT**: When the conversation is about the show, characters, or scenes, you MUST use prepare_turn_context BEFORE responding. This ensures your quotes and references are accurate.
 - If the conversation turns toward creating/continuing the webtoon, suggest 1 concrete beat and (when appropriate) use the tools to update the shared storyline JSON.
 - If {{storyline_focus}} is \"expand\" and a storyline exists, prefer doing ONE of:
-  - add_scene_to_episode(episode_number={{current_episode_number}}, scene_summary=..., panels=[...]) (or omit episode_number to default)
-  - refine_scene(episode_number={{current_episode_number}}, scene_number=..., refinements={...})
+  - add_scene_to_episode(scene_summary=..., panels=[...]) (omit episode_number to default to current episode)
+  - refine_scene(scene_number=..., refinements={...}) (omit episode_number to default to current episode)
   Then continue chatting normally.
+- **CRITICAL**: NEVER try to refine or add scenes to completed episodes. The system will block this and you will waste a turn. Always work on the current episode ({{current_episode_number}}).
 - **CRITICAL for webtoon tools**: When adding or refining scenes, ensure every panel has dialogue. Use formats like:
   * "Character name: [spoken line]"
   * "(Internal monologue) [thought]"
