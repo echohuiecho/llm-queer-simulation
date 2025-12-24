@@ -59,6 +59,9 @@ __pycache__/
 queer-sim-backend/data/show_cache/
 queer-sim-backend/data/rag_cache/
 
+# World State
+queer-sim-backend/data/state/
+
 # Custom RAG directories
 queer-sim-backend/data/rag/
 
@@ -68,5 +71,6 @@ queer-sim-backend/config.json
 # references
 ref/
 
-# webtoon output
+# output
+output/
 webtoon_output/

@@ -4,6 +4,8 @@ import json
 from typing import Any, Dict, List, Optional
 from google.adk.tools.tool_context import ToolContext
 from .state import add_message, add_dm, update_agent_pos, add_to_outbox
+from .persistence import get_storyline_persistence
+from .validation import validate_storyline_state
 from config import config
 
 # We'll need access to the RAG index.
@@ -103,6 +105,12 @@ def plan_storyline(
         state["storyline_review_status"] = "fail"
         return {"result": "fail", "message": "Storyline must be a JSON object at the top level."}
 
+    # Normalize all scenes to ensure they have episode numbers
+    for scene in parsed.get("scenes", []):
+        if isinstance(scene, dict):
+            if "episode" not in scene or scene.get("episode") == 0:
+                scene["episode"] = 1  # Default to episode 1
+
     version = int(state.get("storyline_version") or 0) + 1
     parsed.setdefault("meta", {})
     if isinstance(parsed.get("meta"), dict):
@@ -125,6 +133,16 @@ def plan_storyline(
     })
     # Minimal human-visible message (keeps UI contract unchanged)
     add_message(state, room, "System", f"Storyline draft created (v{version}).")
+
+    # Validate state
+    validation_errors = validate_storyline_state(state)
+    if validation_errors:
+        print(f"[PLAN_STORYLINE] Validation warnings: {validation_errors}")
+
+    # Persist to disk
+    storyline_dir = state.get("storyline_context_dir") or config.get("storyline_context_dir", "default")
+    persistence = get_storyline_persistence()
+    persistence.save_storyline(storyline_dir, parsed, version, update_type="plan")
 
     print(f"[PLAN_STORYLINE] Successfully created storyline v{version} with {len(parsed.get('scenes', []))} scenes")
 
@@ -235,6 +253,12 @@ def refine_storyline(
         state["storyline_review_status"] = "fail"
         return {"result": "fail", "message": "Storyline must be a JSON object at the top level."}
 
+    # Normalize all scenes to ensure they have episode numbers
+    for scene in parsed.get("scenes", []):
+        if isinstance(scene, dict):
+            if "episode" not in scene or scene.get("episode") == 0:
+                scene["episode"] = 1  # Default to episode 1
+
     # CRITICAL: Preserve ALL existing scenes to prevent deletion when LLM omits them
     existing = state.get("current_storyline")
     if isinstance(existing, dict):
@@ -335,25 +359,119 @@ def refine_storyline(
         "storyline_json": state.get("current_storyline_json", "{}"),
         "ts": time.time()
     })
+
+    # Validate state
+    validation_errors = validate_storyline_state(state)
+    if validation_errors:
+        print(f"[REFINE_STORYLINE] Validation warnings: {validation_errors}")
+
+    # Persist to disk
+    storyline_dir = state.get("storyline_context_dir") or config.get("storyline_context_dir", "default")
+    persistence = get_storyline_persistence()
+    persistence.save_storyline(storyline_dir, parsed, version, update_type="refine")
+
     return {"result": "ok", "version": version, "iteration": state["storyline_iteration"]}
 
 
 def exit_loop(*, tool_context: ToolContext) -> Dict[str, Any]:
     """Signal to a LoopAgent that it should stop iterating."""
     state = tool_context.state
+    # Guardrail: do NOT allow "complete" when no storyline exists yet.
+    # We saw repeated "Storyline refinement complete (v0)" messages when the reviewer
+    # incorrectly called exit_loop before plan_storyline/refine_storyline ever ran.
+    try:
+        version = int(state.get("storyline_version") or 0)
+    except Exception:
+        version = 0
+    cur = state.get("current_storyline")
+    cur_json = state.get("current_storyline_json") or ""
+
+    if version <= 0 or not isinstance(cur, dict) or not cur or not str(cur_json).strip():
+        state["storyline_review_status"] = "fail"
+        state["review_feedback"] = "No storyline exists yet. Create one first (plan_storyline) before exiting the loop."
+        add_message(
+            state,
+            "group_chat",
+            "System",
+            "Storyline not created yet (v0). Creating a draft must happen before the refinement loop can exit.",
+        )
+        return {"result": "blocked", "reason": "no_storyline"}
+
     tool_context.actions.escalate = True
 
     # Emit a visible event that the storyline has reached a stopping point.
-    version = state.get("storyline_version")
     add_message(state, "group_chat", "System", f"Storyline refinement complete (v{version}).")
-    return {}
+    return {"result": "ok", "version": version}
 
 def _get_agent_id_from_tool_context(tool_context: ToolContext) -> str:
     agent_name = getattr(tool_context, "agent_name", None)
     agent_id = agent_name or getattr(tool_context, "agent_id", None) or getattr(tool_context, "author", None)
     return str(agent_id) if agent_id else "unknown"
 
-def _bump_storyline_version(state: Dict[str, Any]) -> int:
+def get_episode_progress_summary(state: Dict[str, Any]) -> str:
+    """Return human-readable episode progress for agent prompts.
+
+    Args:
+        state: Current state dictionary
+
+    Returns:
+        Formatted string describing episode progress
+    """
+    storyline = state.get("current_storyline", {})
+    if not isinstance(storyline, dict):
+        return "No storyline created yet."
+
+    scenes = storyline.get("scenes", [])
+    if not scenes:
+        return "Storyline exists but has no scenes yet."
+
+    # Count scenes per episode
+    episode_counts: Dict[int, int] = {}
+    for scene in scenes:
+        if isinstance(scene, dict):
+            ep = int(scene.get("episode") or 0)
+            if ep > 0:
+                episode_counts[ep] = episode_counts.get(ep, 0) + 1
+
+    # Get completion status from meta
+    meta = storyline.get("meta", {})
+    episodes_meta = meta.get("episodes", {}) if isinstance(meta, dict) else {}
+    completed_episodes = set()
+    if isinstance(episodes_meta, dict):
+        for ep_key, ep_info in episodes_meta.items():
+            if isinstance(ep_info, dict) and ep_info.get("complete") is True:
+                try:
+                    completed_episodes.add(int(ep_key))
+                except Exception:
+                    pass
+
+    current_ep = int(state.get("current_episode_number") or 1)
+
+    # Build summary
+    current_ep = int(state.get("current_episode_number") or 1)
+    parts = []
+
+    if current_ep == 1:
+        ep1_scenes = episode_counts.get(1, 0)
+        parts.append(f"Episode 1: {ep1_scenes}/12 scenes complete.")
+        if ep1_scenes >= 12:
+            parts.append("STATUS: Episode 1 Complete!")
+        elif ep1_scenes == 0:
+            parts.append("ACTION REQUIRED: Call plan_storyline() to create initial storyline with at least 3 scenes.")
+        else:
+            remaining = 12 - ep1_scenes
+            parts.append(f"ACTION REQUIRED: Add {remaining} more scene(s) using add_scene_to_episode().")
+            parts.append(f"Each scene must have 3-6 panels with dialogue.")
+    else:
+        parts.append(f"Current episode: {current_ep}")
+        for ep_num in sorted(episode_counts.keys()):
+            count = episode_counts[ep_num]
+            status = "✓ COMPLETE" if ep_num in completed_episodes else "in progress"
+            parts.append(f"  Episode {ep_num}: {count} scene(s) - {status}")
+
+    return "\n".join(parts)
+
+def bump_storyline_version(state: Dict[str, Any]) -> int:
     """Increment storyline_version and keep current_storyline_json/meta updated."""
     version = int(state.get("storyline_version") or 0) + 1
     state["storyline_version"] = version
@@ -372,7 +490,7 @@ def _bump_storyline_version(state: Dict[str, Any]) -> int:
             pass
     return version
 
-def _emit_storyline_update(state: Dict[str, Any], *, room: str = "group_chat"):
+def emit_storyline_update(state: Dict[str, Any], *, room: str = "group_chat"):
     cur = state.get("current_storyline")
     payload = cur if isinstance(cur, dict) else {}
     add_to_outbox(
@@ -428,8 +546,8 @@ def add_scene_to_episode(
         scenes = []
         cur["scenes"] = scenes
 
-    if not isinstance(panels, list) or not panels:
-        return {"result": "fail", "message": "panels must be a non-empty list."}
+    if not isinstance(panels, list) or not (3 <= len(panels) <= 6):
+        return {"result": "fail", "message": "Each scene must contain between 3 and 6 panels."}
 
     normalized_panels: list[dict[str, Any]] = []
     next_panel_num = 1
@@ -466,9 +584,36 @@ def add_scene_to_episode(
         }
     )
 
-    version = _bump_storyline_version(state)
-    _emit_storyline_update(state, room=room)
-    add_message(state, room, "System", f"Added scene {episode_number}.{new_scene_number} (v{version}).")
+    version = bump_storyline_version(state)
+    emit_storyline_update(state, room=room)
+
+    # Progress check for fixed 12 scenes
+    progress_msg = f"Added scene {episode_number}.{new_scene_number} (v{version})."
+    if int(episode_number) == 1:
+        progress_msg += f" Progress: {new_scene_number}/12."
+        if new_scene_number >= 12:
+            progress_msg += " Episode 1 is now complete!"
+            add_message(state, room, "System", progress_msg)
+            process_episode_completion(state, 1, room=room)
+            return {"result": "ok", "version": version, "episode": 1, "scene_number": 12, "completed": True}
+
+    add_message(state, room, "System", progress_msg)
+
+    # Update progress tracking
+    ep_key = str(int(episode_number))
+    if "episode_scene_counts" not in state:
+        state["episode_scene_counts"] = {}
+    state["episode_scene_counts"][ep_key] = state["episode_scene_counts"].get(ep_key, 0) + 1
+    if "update_types_log" not in state:
+        state["update_types_log"] = []
+    state["update_types_log"].append("add_scene")
+    state["last_major_update_ts"] = time.time()
+
+    # Persist to disk
+    storyline_dir = state.get("storyline_context_dir") or config.get("storyline_context_dir", "default")
+    persistence = get_storyline_persistence()
+    persistence.save_storyline(storyline_dir, cur, version, update_type="add_scene")
+
     return {"result": "ok", "version": version, "episode": int(episode_number), "scene_number": int(new_scene_number)}
 
 def refine_scene(
@@ -574,9 +719,22 @@ def refine_scene(
     _apply_map(refinements.get("visual_updates"), "visual_description")
     _apply_map(refinements.get("mood_updates"), "mood")
 
-    version = _bump_storyline_version(state)
-    _emit_storyline_update(state, room=room)
+    # Enforce panel count constraint: 3-6 panels
+    if not (3 <= len(panels) <= 6):
+        # We don't fail here to avoid blocking reasonable refinements,
+        # but we warn and might want to restrict it later.
+        # For now, let's just log a warning.
+        print(f"[REFINE_SCENE] Warning: Scene {episode_number}.{scene_number} has {len(panels)} panels (target 3-6).")
+
+    version = bump_storyline_version(state)
+    emit_storyline_update(state, room=room)
     add_message(state, room, "System", f"Refined scene {episode_number}.{scene_number} (v{version}).")
+
+    # Persist to disk
+    storyline_dir = state.get("storyline_context_dir") or config.get("storyline_context_dir", "default")
+    persistence = get_storyline_persistence()
+    persistence.save_storyline(storyline_dir, cur, version, update_type="refine_scene")
+
     return {"result": "ok", "version": version, "episode": int(episode_number), "scene_number": int(scene_number)}
 
 def propose_episode_complete(
@@ -601,7 +759,7 @@ def propose_episode_complete(
     add_message(state, room, "System", f"{agent_id} proposed completing episode {episode_number}.")
     return {"result": "ok", "episode_number": int(episode_number), "agent_id": agent_id}
 
-def _check_episode_completion_votes(state: Dict[str, Any], *, episode_number: int) -> bool:
+def check_episode_completion_votes(state: Dict[str, Any], *, episode_number: int) -> bool:
     votes = state.get("episode_completion_votes")
     if not isinstance(votes, dict):
         return False
@@ -615,6 +773,130 @@ def _check_episode_completion_votes(state: Dict[str, Any], *, episode_number: in
         if bool(v.get("vote")):
             yes += 1
     return yes >= 2
+
+def detect_votes_in_text(text: str, lang: str = "en") -> tuple[bool, int | None]:
+    """
+    Detect if text contains a vote to complete an episode.
+    Returns (has_vote, episode_number) where episode_number is None if not specified.
+    """
+    if not text or not isinstance(text, str):
+        return (False, None)
+
+    text_lower = text.lower()
+
+    # NOTE: Keep detection reasonably strict to avoid false positives.
+    # We require an explicit "vote"/"投票"/"贊成票"/"完成第X集" intent, not just generic "yes"/"agree"/"好".
+    import re
+
+    vote_intent_patterns = {
+        "en": [
+            r"\b(i\s+)?vote\s+yes\b",
+            r"\b(i\s+)?vote\s+to\s+(complete|finish)\b",
+            r"\bcomplete\s+episode\b",
+            r"\bfinish\s+episode\b",
+        ],
+        "zh_Hans": [
+            r"投(票)?(赞成票|贊成票)",
+            r"我投(票)?(赞成票|贊成票)",
+            r"(完成|结束)第?\s*\d+\s*集",
+            r"(完成|结束)剧集",
+            r"剧集完成",
+        ],
+        "zh_Hant": [
+            r"投(票)?贊成票",
+            r"我投(票)?贊成票",
+            r"(完成|結束)第?\s*\d+\s*集",
+            r"(完成|結束)劇集",
+            r"劇集完成",
+        ],
+    }
+
+    patterns = vote_intent_patterns.get(lang, vote_intent_patterns["en"])
+    has_vote = any(re.search(p, text, flags=re.IGNORECASE) for p in patterns)
+    if not has_vote:
+        return (False, None)
+
+    # Try to extract episode number
+    # Look for patterns like "episode 1", "episode 2", "第1集", "第2集", etc.
+    ep_patterns = {
+        "en": [r"episode\s+(\d+)", r"ep\s+(\d+)"],
+        "zh_Hans": [r"第(\d+)集", r"剧集\s*(\d+)"],
+        "zh_Hant": [r"第(\d+)集", r"劇集\s*(\d+)"],
+    }
+
+    patterns = ep_patterns.get(lang, ep_patterns["en"])
+    for pattern in patterns:
+        match = re.search(pattern, text_lower)
+        if match:
+            try:
+                ep_num = int(match.group(1))
+                return (True, ep_num)
+            except (ValueError, IndexError):
+                pass
+
+    # If vote detected but no episode number, return True with None
+    return (True, None)
+
+def process_episode_completion(state: Dict[str, Any], episode_number: int, room: str = "group_chat") -> Dict[str, Any]:
+    """
+    Shared helper to process episode completion: mark complete, bump version, move to next episode, persist.
+    Returns dict with completion status and version.
+    """
+    cur = state.get("current_storyline")
+    if isinstance(cur, dict):
+        cur.setdefault("meta", {})
+        if isinstance(cur.get("meta"), dict):
+            cur["meta"].setdefault("episodes", {})
+            if isinstance(cur["meta"].get("episodes"), dict):
+                ep_key = str(int(episode_number))
+                cur["meta"]["episodes"].setdefault(ep_key, {})
+                if isinstance(cur["meta"]["episodes"][ep_key], dict):
+                    cur["meta"]["episodes"][ep_key]["complete"] = True
+                    cur["meta"]["episodes"][ep_key]["completed_ts"] = time.time()
+
+    version = bump_storyline_version(state)
+    emit_storyline_update(state, room=room)
+    add_to_outbox(
+        state,
+        {
+            "type": "episode_complete",
+            "episode_number": int(episode_number),
+            "version": version,
+            "room": room,
+            "ts": time.time(),
+            "title": (state.get("current_storyline") or {}).get("title", "")
+            if isinstance(state.get("current_storyline"), dict)
+            else "",
+        },
+    )
+    add_message(state, room, "System", f"Episode {episode_number} marked complete (v{version}).")
+
+    # Clear votes and proposals
+    state["episode_completion_proposals"] = {}
+    state["episode_completion_votes"] = {}
+
+    # Move to next episode
+    try:
+        next_ep = int(episode_number) + 1
+        state["current_episode_number"] = next_ep
+    except Exception:
+        next_ep = 1
+        state["current_episode_number"] = 1
+
+    add_message(state, room, "System", f"Episode {episode_number} complete. Starting work on Episode {next_ep}.")
+
+    # Update progress tracking
+    if "update_types_log" not in state:
+        state["update_types_log"] = []
+    state["update_types_log"].append("complete_episode")
+    state["last_major_update_ts"] = time.time()
+
+    # Persist to disk
+    storyline_dir = state.get("storyline_context_dir") or config.get("storyline_context_dir", "default")
+    persistence = get_storyline_persistence()
+    persistence.save_storyline(storyline_dir, cur, version, update_type="complete_episode")
+
+    return {"completed": True, "episode_number": int(episode_number), "version": version, "next_episode": next_ep}
 
 def vote_episode_complete(
     episode_number: int,
@@ -632,48 +914,9 @@ def vote_episode_complete(
         state["episode_completion_votes"] = votes
     votes[agent_id] = {"episode_number": int(episode_number), "vote": bool(vote), "ts": time.time()}
 
-    if _check_episode_completion_votes(state, episode_number=int(episode_number)):
-        cur = state.get("current_storyline")
-        if isinstance(cur, dict):
-            cur.setdefault("meta", {})
-            if isinstance(cur.get("meta"), dict):
-                cur["meta"].setdefault("episodes", {})
-                if isinstance(cur["meta"].get("episodes"), dict):
-                    ep_key = str(int(episode_number))
-                    cur["meta"]["episodes"].setdefault(ep_key, {})
-                    if isinstance(cur["meta"]["episodes"][ep_key], dict):
-                        cur["meta"]["episodes"][ep_key]["complete"] = True
-                        cur["meta"]["episodes"][ep_key]["completed_ts"] = time.time()
-
-        version = _bump_storyline_version(state)
-        _emit_storyline_update(state, room=room)
-        add_to_outbox(
-            state,
-            {
-                "type": "episode_complete",
-                "episode_number": int(episode_number),
-                "version": version,
-                "room": room,
-                "ts": time.time(),
-                "title": (state.get("current_storyline") or {}).get("title", "")
-                if isinstance(state.get("current_storyline"), dict)
-                else "",
-            },
-        )
-        add_message(state, room, "System", f"Episode {episode_number} marked complete (v{version}).")
-
-        state["episode_completion_proposals"] = {}
-        state["episode_completion_votes"] = {}
-        try:
-            next_ep = int(episode_number) + 1
-            state["current_episode_number"] = next_ep
-        except Exception:
-            next_ep = 1
-            state["current_episode_number"] = 1
-
-        add_message(state, room, "System", f"Episode {episode_number} complete. Starting work on Episode {next_ep}.")
-
-        return {"result": "ok", "completed": True, "episode_number": int(episode_number), "version": version}
+    if check_episode_completion_votes(state, episode_number=int(episode_number)):
+        result = process_episode_completion(state, int(episode_number), room=room)
+        return {"result": "ok", "completed": True, "episode_number": int(episode_number), "version": result["version"]}
 
     return {"result": "ok", "completed": False, "episode_number": int(episode_number), "agent_id": agent_id}
 

@@ -329,7 +329,9 @@ Mika是一名研究生，將粉絲圈作為壓力釋放。她喜歡化學反應�
             "openai_translate_model": os.getenv("OPENAI_TRANSLATE_MODEL", "gpt-4o"),
             "openai_vision_model": os.getenv("OPENAI_VISION_MODEL", "gpt-4o"),
             "google_api_key": os.getenv("GOOGLE_API_KEY", ""),
-            "youtube_frame_scene_threshold": 0.3
+            "youtube_frame_scene_threshold": 0.3,
+            "storyline_context_dir": "",
+            "storyline_context_content": ""
         }
         self.data = self.load()
 

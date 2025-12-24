@@ -36,6 +36,8 @@ interface Settings {
   initial_messages_en?: InitialMessage[];
   initial_messages_zh_Hans?: InitialMessage[];
   initial_messages_zh_Hant?: InitialMessage[];
+  storyline_context_dir?: string;
+  storyline_context_content?: string;
 }
 
 export default function SettingsPage() {
@@ -50,11 +52,46 @@ export default function SettingsPage() {
   const [youtubeJobId, setYoutubeJobId] = useState<string | null>(null);
   const [youtubeJobStatus, setYoutubeJobStatus] = useState<any>(null);
   const [currentLanguage, setCurrentLanguage] = useState<string>("en");
+  const [storylines, setStorylines] = useState<string[]>([]);
+  const [selectedStoryline, setSelectedStoryline] = useState<string>("");
 
   useEffect(() => {
     fetchSettings();
     fetchRagDirs();
+    fetchStorylines();
   }, []);
+
+  const fetchStorylines = async () => {
+    try {
+      const response = await fetch("http://localhost:8000/api/storylines");
+      const data = await response.json();
+      setStorylines(data.storylines || []);
+      setSelectedStoryline(data.current || "");
+    } catch (error) {
+      console.error("Failed to fetch storylines:", error);
+    }
+  };
+
+  const selectStoryline = async (name: string) => {
+    try {
+      const response = await fetch("http://localhost:8000/api/storylines/select", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      });
+      if (response.ok) {
+        const data = await response.json();
+        setSelectedStoryline(data.current || "");
+        setSettings(prev => prev ? {
+          ...prev,
+          storyline_context_dir: data.current || "",
+          storyline_context_content: data.content || ""
+        } : null);
+      }
+    } catch (error) {
+      console.error("Failed to select storyline:", error);
+    }
+  };
 
   useEffect(() => {
     let interval: any;
@@ -170,6 +207,11 @@ export default function SettingsPage() {
 
       setSettings(data);
       setCurrentLanguage(normalizedLang);
+
+      // Set selected storyline if available
+      if (data.storyline_context_dir) {
+        setSelectedStoryline(data.storyline_context_dir);
+      }
     } catch (error) {
       console.error("Failed to fetch settings:", error);
     } finally {
@@ -379,6 +421,11 @@ export default function SettingsPage() {
 
     setStartConversationStatus("Starting conversation...");
     try {
+      // Ensure storyline selection is saved before starting conversation
+      if (selectedStoryline) {
+        await selectStoryline(selectedStoryline);
+      }
+
       const response = await fetch("http://localhost:8000/api/rag/start-conversation", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -548,6 +595,40 @@ export default function SettingsPage() {
               </button>
             </div>
           ))}
+        </section>
+
+        {/* Storyline Context Section */}
+        <section style={{ marginBottom: 48 }}>
+          <h2 style={{ fontSize: 20, fontWeight: 600, marginBottom: 20, opacity: 0.8 }}>Storyline Context</h2>
+          <div style={{ padding: 24, borderRadius: 16, background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.05)" }}>
+            <div style={{ marginBottom: 24 }}>
+              <label style={{ display: "block", fontSize: 12, opacity: 0.5, marginBottom: 8 }}>Select Storyline</label>
+              <div style={{ display: "flex", gap: 12, alignItems: "flex-end" }}>
+                <div style={{ flex: 1 }}>
+                  <select
+                    value={selectedStoryline}
+                    onChange={(e) => selectStoryline(e.target.value)}
+                    style={{ width: "100%", padding: 10, background: "#111", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 8, color: "white" }}
+                  >
+                    <option value="">None (Use fixed initial messages)</option>
+                    {storylines.map(storyline => (
+                      <option key={storyline} value={storyline}>{storyline}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+              {selectedStoryline && (
+                <div style={{ marginTop: 12, fontSize: 12, opacity: 0.7 }}>
+                  Selected: <strong>{selectedStoryline}</strong>. Initial messages will be dynamically generated based on this storyline's context.
+                </div>
+              )}
+              {!selectedStoryline && (
+                <div style={{ marginTop: 12, fontSize: 12, opacity: 0.7 }}>
+                  No storyline selected. Using fixed initial messages from settings.
+                </div>
+              )}
+            </div>
+          </div>
         </section>
 
         {/* RAG Data Section */}

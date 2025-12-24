@@ -3,7 +3,7 @@ from google.adk.agents import LlmAgent, SequentialAgent
 from .personas import create_persona_agent
 from config import config
 from ..tools import dispatch_persona_replies
-from .storyline import create_storyline_pipeline
+from .storyline import create_storyline_pipeline, create_storyline_plan_only_pipeline
 
 def create_dispatch_agent() -> LlmAgent:
     """Create a fresh dispatch agent instance to avoid parent agent conflicts."""
@@ -19,7 +19,11 @@ Do not write anything else.
     )
 
 
-def create_root_agent_with_shuffled_order(*, enable_storyline: bool = False) -> SequentialAgent:
+def create_root_agent_with_shuffled_order(
+    *,
+    enable_storyline: bool = False,
+    storyline_mode: str = "full",  # "full" | "plan_only"
+) -> SequentialAgent:
     """
     Create a root SequentialAgent with persona agents in a random order.
     This ensures each agent sees state updates in a different order each turn.
@@ -61,9 +65,12 @@ def create_root_agent_with_shuffled_order(*, enable_storyline: bool = False) -> 
 
     sub_agents = [sequential_deciders, fresh_dispatch_agent]
 
-    # Optional extension: webtoon storyline planning + iterative refinement loop.
+    # Optional extension: webtoon storyline planning.
     if enable_storyline:
-        sub_agents.append(create_storyline_pipeline())
+        if storyline_mode == "plan_only":
+            sub_agents.append(create_storyline_plan_only_pipeline())
+        else:
+            sub_agents.append(create_storyline_pipeline())
 
     # Create root agent with sequential deciders + dispatch (+ optional storyline pipeline)
     root = SequentialAgent(
@@ -71,7 +78,7 @@ def create_root_agent_with_shuffled_order(*, enable_storyline: bool = False) -> 
         sub_agents=sub_agents,
         description=(
             "Sequential persona agents (with shuffled order each turn) + deterministic dispatch"
-            + (" + webtoon storyline planning loop" if enable_storyline else "")
+            + (" + webtoon storyline planning" if enable_storyline else "")
         ),
     )
 

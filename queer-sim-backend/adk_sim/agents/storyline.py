@@ -306,6 +306,7 @@ def create_storyline_refiner() -> LlmAgent:
 输入：
 - 当前故事情节JSON：{{current_storyline_json}}
 - 审查反馈：{{review_feedback}}
+- 剧集进度摘要：{{episode_progress}}
 
 任务：
 - 应用反馈并改进故事情节。
@@ -314,6 +315,7 @@ def create_storyline_refiner() -> LlmAgent:
 - 确保场景/面板适合网络漫画（垂直堆叠）。
 - 关键：确保每个面板都有对话。使用格式如"角色：[台词]"、"（内心独白）[想法]"或"（叙述）[文本]"。仅对真正沉默的时刻使用""（每个场景最多1-2个）。
 - 关键：细化时，你必须在JSON输出中包含所有剧集的所有现有场景。不要删除已完成剧集或当前剧集的场景。系统会保留它们，但你应该包含它们以保持故事连续性。
+- 关键：如果当前剧集有≥3个场景且面板质量良好，考虑提议完成该剧集并开始下一剧集。
 
 输出说明：
 1) 仅生成严格的JSON字符串。
@@ -329,6 +331,7 @@ def create_storyline_refiner() -> LlmAgent:
 輸入：
 - 當前故事情節JSON：{{current_storyline_json}}
 - 審查反饋：{{review_feedback}}
+- 劇集進度摘要：{{episode_progress}}
 
 任務：
 - 應用反饋並改進故事情節。
@@ -337,6 +340,7 @@ def create_storyline_refiner() -> LlmAgent:
 - 確保場景/面板適合網絡漫畫（垂直堆疊）。
 - 關鍵：確保每個面板都有對話。使用格式如"角色：[台詞]"、"（內心獨白）[想法]"或"（敘述）[文本]"。僅對真正沉默的時刻使用""（每個場景最多1-2個）。
 - 關鍵：細化時，你必須在JSON輸出中包含所有劇集的所有現有場景。不要刪除已完成劇集或當前劇集的場景。系統會保留它們，但你應該包含它們以保持故事連續性。
+- 關鍵：如果當前劇集有≥3個場景且面板質量良好，考慮提議完成該劇集並開始下一劇集。
 
 輸出說明：
 1) 僅生成嚴格的JSON字符串。
@@ -352,6 +356,7 @@ You refine a webtoon storyline JSON.
 Inputs:
 - Current storyline JSON: {{current_storyline_json}}
 - Review feedback: {{review_feedback}}
+- Episode progress summary: {{episode_progress}}
 
 Task:
 - Apply the feedback and improve the storyline.
@@ -360,6 +365,7 @@ Task:
 - Ensure scenes/panels are webtoon-friendly (vertical stacking).
 - CRITICAL: Ensure every panel has dialogue. Use formats like "Character: [line]", "(Internal monologue) [thought]", or "(Narration) [text]". Only use "" for truly silent moments (max 1-2 per scene).
 - CRITICAL: When refining, you MUST include ALL existing scenes from ALL episodes in your JSON output. Do NOT remove scenes from completed episodes or the current episode. The system will preserve them, but you should include them to maintain story continuity.
+- CRITICAL: If the current episode has ≥3 scenes with good panels, consider proposing it complete and starting the next episode.
 
 Output instructions:
 1) Produce STRICT JSON string only.
@@ -392,6 +398,15 @@ def create_storyline_pipeline() -> SequentialAgent:
         name="WebtoonStorylinePipeline",
         sub_agents=[create_storyline_planner(), create_storyline_planning_loop()],
         description="Generates and refines a webtoon storyline through an iterative review process.",
+    )
+
+
+def create_storyline_plan_only_pipeline() -> SequentialAgent:
+    """Planner only (no reviewer/refiner loop). Used to reliably create v1 quickly."""
+    return SequentialAgent(
+        name="WebtoonStorylinePlanOnly",
+        sub_agents=[create_storyline_planner()],
+        description="Creates an initial webtoon storyline draft (planner only).",
     )
 
 

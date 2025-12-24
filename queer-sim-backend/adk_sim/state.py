@@ -45,6 +45,10 @@ def get_initial_state() -> Dict[str, Any]:
         "last_storyline_update_ts": 0.0,
         "episode_completion_proposals": {},  # agent_id -> {episode_number, reason, ts}
         "episode_completion_votes": {},      # agent_id -> {episode_number, vote, ts}
+        "episode_scene_counts": {},          # {episode_num: scene_count}
+        "episode_creation_ts": {},          # {episode_num: timestamp}
+        "last_major_update_ts": 0.0,
+        "update_types_log": [],              # ["add_scene", "refine_scene", "complete_episode"]
 
         # --- Story completion (overall ending) ---
         "story_completion_proposals": {},  # agent_id -> {reason, ts}
