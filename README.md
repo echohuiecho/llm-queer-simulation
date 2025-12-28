@@ -137,7 +137,84 @@ The simulation supports using external documents to inform agent conversations.
 
 The simulation uses **Google ADK** for agent orchestration with a dynamic sequential multi-agent architecture:
 
-### Webtoon Storyline Planning Loop Integration
+### RoleArena-Style Narrative Control Architecture
+
+This system implements **RoleArena** research paper's approach: discrete plot nodes, turn-by-turn environment control, and pacing gates.
+
+```mermaid
+graph TD
+    User[User/Director Message] --> Root[RoleArena Turn Orchestrator]
+
+    Root --> DIP[DirectorIntentParser]
+    DIP --> Intent[Extract: goal, constraints, controls<br/>pace/spice/angst/comedy]
+    Intent --> State[Update Director State]
+
+    State --> EnvAgent[EnvAgent: Environment Control]
+    EnvAgent --> TurnPlan[Generate TurnPlan:<br/>- narration 1-3 sentences<br/>- next_speaker<br/>- micro_objectives a1,a2,a3<br/>- beat_focus<br/>- advance_candidate?]
+
+    TurnPlan --> Speaker{Select<br/>Speaker}
+
+    Speaker -->|next_speaker=a1| A1[Persona Agent a1]
+    Speaker -->|next_speaker=a2| A2[Persona Agent a2]
+    Speaker -->|next_speaker=a3| A3[Persona Agent a3]
+
+    A1 --> Response[Character Response:<br/>thought/action/utterance]
+    A2 --> Response
+    A3 --> Response
+
+    Response --> AdvJudge[EnvAdvanceJudge]
+    AdvJudge --> Check{advance_candidate?}
+
+    Check -->|No| Continue[Continue Current Node]
+    Check -->|Yes| Critic[CriticGate: Pacing Control]
+
+    Critic --> Approve{Approve<br/>Advance?}
+
+    Approve -->|No| Continue
+    Approve -->|Yes| Bridge[Generate Bridge Narration]
+    Bridge --> Advance[Advance Plot Node]
+    Advance --> NextNode[node_idx++, node_turns=0]
+
+    Continue --> Quality[Update Quality Flags]
+    NextNode --> Quality
+
+    Quality --> Dispatch[Dispatch Events]
+    Dispatch --> WS[WebSocket Broadcast]
+
+    subgraph "Plot State (Discrete Nodes)"
+        Nodes[nodes: list of plot beats<br/>- Setup + Spark<br/>- Proximity Lock-in<br/>- Misunderstanding<br/>- Almost-Date<br/>- Vulnerability Reveal<br/>- External Pressure<br/>- Choice Point<br/>- Confession<br/>- Aftermath + Hook]
+        NodeIdx[node_idx: current node]
+        NodeTurns[node_turns: turns in node]
+        TotalTurns[total_turns: overall]
+    end
+
+    subgraph "Director Controls"
+        Pace[pace: slow/med/fast]
+        Spice[spice: 0-3]
+        Angst[angst: 0-3]
+        Comedy[comedy: 0-2]
+    end
+
+    style Root fill:#e1f5ff
+    style EnvAgent fill:#ffe1f5
+    style Critic fill:#fff5e1
+    style DIP fill:#f5ffe1
+    style Nodes fill:#f0f0f0
+```
+
+#### RoleArena Key Features
+
+1. **Discrete Plot Nodes**: Story is structured as a sequence of beats (9 nodes for GL arc)
+2. **Environment Agent (EnvAgent)**: Runs **every turn** to control narration, speaker selection, and advancement detection
+3. **Critic Gate**: Pacing controller that approves/rejects plot node transitions based on turn budgets and story quality
+4. **Director Mode**: User is an out-of-world director providing constraints and controls (not an in-character participant)
+5. **Turn-Level Control**: Every turn has explicit micro-objectives for each character, ensuring plot progression
+6. **Separate Channels**: Narration (scene-keeping) vs Character Responses (dialogue) are distinct
+7. **Quality Monitoring**: Lightweight flags (repetition_risk, character_drift_risk, plot_stall_risk) prevent common failure modes
+
+#### Webtoon Storyline Planning Loop (Legacy Mode)
+
+For webtoon generation, the system also supports a milestone-triggered planning loop:
 
 ```mermaid
 graph TD

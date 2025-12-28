@@ -22,6 +22,25 @@ from google.adk.events.event import Event
 from google.adk.events.event_actions import EventActions
 from google.genai import types
 
+# RoleArena Imports
+from adk_sim.rolearena_state import init_rolearena_story_state, get_current_node, increment_turn
+from adk_sim.agents.rolearena_agents import (
+    create_env_agent,
+    create_critic_gate,
+    should_advance_node,
+    generate_bridge_narration,
+    compute_quality_flags,
+)
+from adk_sim.agents.rolearena_root import create_rolearena_persona_agent
+from adk_sim.rolearena_tools import (
+    emit_narration,
+    advance_plot,
+    increment_story_turn,
+)
+
+# RoleArena Mode Flag (can be toggled via API)
+ROLEARENA_MODE = False
+
 # Silence noisy google-genai warning logs when responses include function_call parts.
 # (ADK responses commonly include tool/function_call parts.)
 logging.getLogger("google_genai.types").setLevel(logging.ERROR)
@@ -72,11 +91,46 @@ GLOBAL_SESSION_ID = "default_sim"
 GLOBAL_USER_ID = "simulation_user"
 
 # Initialize global session
+# State will be initialized based on ROLEARENA_MODE
+def _get_initial_session_state():
+    """Get initial state based on current mode."""
+    if ROLEARENA_MODE:
+        print("[SERVER] Initializing RoleArena mode state")
+        state = init_rolearena_story_state(
+            director_first_message="Welcome to RoleArena mode! Let's create a Girls' Love story.",
+            controls={"pace": "slow", "spice": 1, "angst": 2, "comedy": 1},
+            num_nodes=9
+        )
+        # Ensure RoleArena state has required fields for compatibility
+        if "rooms" not in state:
+            state["rooms"] = ["group_chat"]
+        if "history" not in state:
+            state["history"] = {"group_chat": []}
+        if "agents" not in state:
+            # Add agents from config
+            profiles = config.get("agent_profiles", {})
+            state["agents"] = []
+            for aid, p in profiles.items():
+                state["agents"].append({
+                    "id": aid,
+                    "name": p.get("name", aid),
+                    "room": "group_chat",
+                    "pos": {"x": 0.5, "y": 0.5},
+                    "room_entered_ts": time.time()
+                })
+        if "outbox" not in state:
+            state["outbox"] = []
+        if "rag_directory" not in state:
+            state["rag_directory"] = config.get("rag_directory", "default")
+        return state
+    else:
+        return get_initial_state()
+
 session_service.create_session_sync(
     app_name="QueerSim",
     user_id=GLOBAL_USER_ID,
     session_id=GLOBAL_SESSION_ID,
-    state=get_initial_state()
+    state=_get_initial_session_state()
 )
 
 # YouTube Ingest Manager
@@ -352,13 +406,365 @@ async def flush_adk_outbox():
     # Clear outbox
     await apply_state_delta({"outbox": []}, author="user")
 
+async def run_rolearena_turn(new_message_text: str):
+    """Run a RoleArena-style turn.
+
+    Flow:
+    1. DirectorIntentParser (extract user intent)
+    2. EnvAgent (generate turn plan: narration + objectives + advance detection)
+    3. Selected Persona Agent (character speaks using micro-objective)
+    4. EnvAdvanceJudge (check if node should advance)
+    5. CriticGate (if advance_candidate, approve/reject)
+    6. Advance plot (if approved, with bridge narration)
+    7. Increment turn counters
+    8. Update quality flags
+    """
+    print("[ROLEARENA] Starting RoleArena turn")
+
+    session = await session_service.get_session(
+        app_name="QueerSim",
+        user_id=GLOBAL_USER_ID,
+        session_id=GLOBAL_SESSION_ID
+    )
+
+    if not session:
+        print("[ROLEARENA] No session found")
+        return
+
+    state = session.state
+
+    # Step 1: Extract director intent (simplified - could use LLM)
+    print(f"[ROLEARENA] Director message: {new_message_text[:100]}...")
+
+    # Step 2: EnvAgent generates turn plan
+    current_node = get_current_node(state)
+    if not current_node:
+        print("[ROLEARENA] No current node, cannot proceed")
+        return
+
+    print(f"[ROLEARENA] Current node: {current_node['beat']}")
+    plot = state.get("plot", {})
+    node_idx = plot.get("node_idx", 0)
+    node_turns = plot.get("node_turns", 0)
+
+    # Use actual EnvAgent if Gemini is available
+    if HAS_GEMINI:
+        try:
+            print("[ROLEARENA] Calling EnvAgent LLM...")
+            from adk_sim.agents.rolearena_agents import create_env_agent
+
+            # Prepare context for EnvAgent
+            history = state.get("history", {}).get("group_chat", [])
+            recent_history = history[-10:] if len(history) > 10 else history
+
+            env_context = {
+                "story_state": {
+                    "plot": plot,
+                    "current_node": current_node,
+                    "characters": state.get("characters", {}),
+                },
+                "director_message": new_message_text,
+                "director_controls": state.get("director", {}).get("controls", {}),
+                "recent_dialogue": [{"from": m.get("from", ""), "text": m.get("text", "")} for m in recent_history],
+            }
+
+            env_agent = create_env_agent()
+
+            # Run EnvAgent (simplified - in full integration, use Runner)
+            # For now, construct turn plan manually with LLM-generated content
+            from google.genai import Client
+            api_key = config.get("google_api_key")
+            client = Client(api_key=api_key)
+
+            env_prompt = f"""Current story state:
+- Node: {current_node['beat']} (turn {node_turns})
+- Goal: {current_node['goal']}
+- Director message: {new_message_text}
+- Controls: {state.get('director', {}).get('controls', {})}
+
+Recent dialogue:
+{chr(10).join([f"- {m['from']}: {m['text'][:100]}" for m in recent_history[-3:]])}
+
+Generate a turn plan as JSON:
+- narration: 1-3 sentence scene narration
+- beat_focus: what must progress in this node
+- next_speaker: choose from [a1, a2, a3]
+- micro_objectives: {{a1: str, a2: str, a3: str}}
+- style_rules: list of 3-5 rules
+- advance_candidate: boolean (should we check for node advance?)
+- advance_reason: string (why/why not)
+"""
+
+            response = client.models.generate_content(
+                model="gemini-2.0-flash-exp",
+                contents=env_prompt
+            )
+
+            # Parse JSON response
+            import json
+            import re
+            response_text = response.text.strip()
+            # Extract JSON from markdown code blocks if present
+            json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response_text, re.DOTALL)
+            if json_match:
+                response_text = json_match.group(1)
+
+            turn_plan = json.loads(response_text)
+            print(f"[ROLEARENA] EnvAgent generated turn plan: next={turn_plan.get('next_speaker')}, advance={turn_plan.get('advance_candidate')}")
+
+        except Exception as e:
+            print(f"[ROLEARENA] EnvAgent LLM failed: {e}, using fallback")
+            import traceback
+            traceback.print_exc()
+            # Fallback to simple turn plan
+            turn_plan = {
+                "narration": f"The story continues at {current_node['beat']}.",
+                "beat_focus": current_node.get("goal", "Continue story development"),
+                "speaker_order": ["a1", "a2", "a3"],
+                "next_speaker": ["a1", "a2", "a3"][node_turns % 3],
+                "micro_objectives": {
+                    "a1": "Show emotion through action",
+                    "a2": "Respond with vulnerability",
+                    "a3": "Add external pressure or catalyst"
+                },
+                "style_rules": ["Show don't tell", "Keep GL tone", "Use subtext"],
+                "advance_candidate": False,
+                "advance_reason": "",
+                "node_idx": node_idx,
+                "node_turns": node_turns
+            }
+    else:
+        # Fallback when no Gemini API key
+        print("[ROLEARENA] No Gemini API key, using simple turn plan")
+        turn_plan = {
+            "narration": f"The story continues at {current_node['beat']}.",
+            "beat_focus": current_node.get("goal", "Continue story development"),
+            "speaker_order": ["a1", "a2", "a3"],
+            "next_speaker": ["a1", "a2", "a3"][node_turns % 3],
+            "micro_objectives": {
+                "a1": "Show emotion through action",
+                "a2": "Respond with vulnerability",
+                "a3": "Add external pressure or catalyst"
+            },
+            "style_rules": ["Show don't tell", "Keep GL tone", "Use subtext"],
+            "advance_candidate": False,
+            "advance_reason": "",
+            "node_idx": node_idx,
+            "node_turns": node_turns
+        }
+
+    print(f"[ROLEARENA] Next speaker: {turn_plan['next_speaker']}")
+
+    # Store turn plan in state
+    state["env_turn_plan"] = turn_plan
+
+    # Emit narration if present
+    if turn_plan.get("narration"):
+        from adk_sim.state import add_message
+        add_message(state, "group_chat", "Narrator", turn_plan["narration"])
+        print(f"[ROLEARENA] Narration: {turn_plan['narration']}")
+
+    # Step 3: Selected persona speaks
+    from adk_sim.state import add_message
+    profiles = config.get("agent_profiles", {})
+    next_speaker = turn_plan["next_speaker"]
+    speaker_name = profiles.get(next_speaker, {}).get("name", next_speaker)
+    objective = turn_plan["micro_objectives"].get(next_speaker, "Respond naturally")
+
+    if HAS_GEMINI:
+        try:
+            print(f"[ROLEARENA] Calling Persona Agent LLM for {speaker_name}...")
+
+            # Prepare context for persona agent
+            history = state.get("history", {}).get("group_chat", [])
+            recent_history = history[-8:] if len(history) > 8 else history
+
+            profile = profiles.get(next_speaker, {})
+            character = state.get("characters", {}).get(next_speaker, {})
+
+            persona_prompt = f"""You are {speaker_name} in a Girls' Love story.
+
+Character profile:
+- Role: {character.get('role', 'character')}
+- Traits: {', '.join(character.get('traits', []))}
+- Wants: {character.get('wants', 'happiness')}
+
+Current scene:
+- Narration: {turn_plan.get('narration', '')}
+- Beat focus: {turn_plan.get('beat_focus', '')}
+- Your objective: {objective}
+
+Recent dialogue:
+{chr(10).join([f"- {m['from']}: {m['text'][:150]}" for m in recent_history[-3:]])}
+
+Respond in-character with a natural dialogue line (1-3 lines max). Show subtext and emotion. Keep GL tone.
+Output ONLY the dialogue, no explanations or meta-commentary."""
+
+            from google.genai import Client
+            api_key = config.get("google_api_key")
+            client = Client(api_key=api_key)
+
+            response = client.models.generate_content(
+                model="gemini-2.0-flash-exp",
+                contents=persona_prompt
+            )
+
+            response_text = response.text.strip()
+            # Remove quotes if present
+            if response_text.startswith('"') and response_text.endswith('"'):
+                response_text = response_text[1:-1]
+
+            print(f"[ROLEARENA] {speaker_name}: {response_text[:100]}...")
+
+        except Exception as e:
+            print(f"[ROLEARENA] Persona Agent LLM failed: {e}, using fallback")
+            import traceback
+            traceback.print_exc()
+            response_text = f"[Objective: {objective}] {speaker_name} responds to the story development."
+    else:
+        # Fallback when no Gemini API key
+        print(f"[ROLEARENA] No Gemini API key, using simple response for {speaker_name}")
+        response_text = f"[Objective: {objective}] {speaker_name} responds to the story development."
+
+    add_message(state, "group_chat", speaker_name, response_text)
+
+    # Step 4: Check if we should advance
+    recent_dialogue = new_message_text + " " + response_text
+    advance_result = should_advance_node(state, recent_dialogue)
+    print(f"[ROLEARENA] Advance check: {advance_result['should_advance']} - {advance_result['reason']}")
+
+    if advance_result["should_advance"]:
+        # Step 5: Critic approval
+        node_budget = plot.get("node_budget", {})
+        min_turns = node_budget.get("min", 3)
+
+        critic_approved = False
+
+        if HAS_GEMINI:
+            try:
+                print("[ROLEARENA] Calling CriticGate LLM...")
+
+                nodes = plot.get("nodes", [])
+                next_node = nodes[node_idx + 1] if node_idx < len(nodes) - 1 else None
+
+                history = state.get("history", {}).get("group_chat", [])
+                recent_history = history[-5:] if len(history) > 5 else history
+
+                critic_prompt = f"""You are CriticGate (Pacing & Turn Budget Controller).
+Should we advance from the current plot node to the next node NOW?
+
+Current node: {current_node['beat']}
+- Goal: {current_node['goal']}
+- Exit conditions: {current_node.get('exit_conditions', [])}
+- Node turns: {node_turns}
+- Budget: min={node_budget.get('min', 3)}, target={node_budget.get('target', 5)}, hard_cap={node_budget.get('hard_cap', 7)}
+
+Next node: {next_node['beat'] if next_node else 'NONE (last node)'}
+
+Director controls: {state.get('director', {}).get('controls', {})}
+
+Recent dialogue:
+{chr(10).join([f"- {m['from']}: {m['text'][:100]}" for m in recent_history[-3:]])}
+
+EnvAgent advance reason: {advance_result['reason']}
+
+Respond with JSON:
+- approve_advance: boolean
+- why: string (short, concrete reason)
+- required_before_advance: list of 0-3 concrete requirements if rejecting
+
+Decision guidelines:
+- If exit_conditions met and node_turns >= min → usually approve
+- If node_turns < min → usually reject unless pace=fast
+- If node_turns >= hard_cap → approve (avoid stagnation)
+- Reject if emotional beat is undercooked
+"""
+
+                from google.genai import Client
+                api_key = config.get("google_api_key")
+                client = Client(api_key=api_key)
+
+                response = client.models.generate_content(
+                    model="gemini-2.0-flash-exp",
+                    contents=critic_prompt
+                )
+
+                # Parse JSON response
+                import json
+                import re
+                response_text = response.text.strip()
+                json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response_text, re.DOTALL)
+                if json_match:
+                    response_text = json_match.group(1)
+
+                critic_verdict = json.loads(response_text)
+                critic_approved = critic_verdict.get("approve_advance", False)
+                print(f"[ROLEARENA] CriticGate verdict: {critic_approved} - {critic_verdict.get('why', 'No reason')}")
+
+            except Exception as e:
+                print(f"[ROLEARENA] CriticGate LLM failed: {e}, using simple fallback")
+                import traceback
+                traceback.print_exc()
+                # Fallback: approve if minimum turns met
+                critic_approved = node_turns >= min_turns
+        else:
+            # Fallback when no Gemini API key
+            print(f"[ROLEARENA] No Gemini API key, using simple critic check")
+            critic_approved = node_turns >= min_turns
+
+        if critic_approved:
+            # Step 6: Advance plot
+            print("[ROLEARENA] Critic approved advancement")
+            nodes = plot.get("nodes", [])
+            if node_idx < len(nodes) - 1:
+                current = nodes[node_idx]
+                next_node = nodes[node_idx + 1]
+                bridge = generate_bridge_narration(state, current, next_node)
+
+                from adk_sim.rolearena_state import advance_plot_node
+                advance_plot_node(state, bridge)
+
+                add_message(state, "group_chat", "Narrator", bridge)
+                print(f"[ROLEARENA] Advanced to node {node_idx + 1}: {next_node['beat']}")
+        else:
+            print("[ROLEARENA] Critic rejected advancement, continuing current node")
+
+    # Step 7: Increment turn
+    from adk_sim.rolearena_state import increment_turn as rolearena_increment_turn
+    rolearena_increment_turn(state)
+
+    # Step 8: Update quality flags
+    flags = compute_quality_flags(state, recent_dialogue)
+    from adk_sim.rolearena_state import update_quality_flags
+    update_quality_flags(state, flags)
+
+    # Persist state
+    await apply_state_delta({
+        "plot": state.get("plot", {}),
+        "env_turn_plan": state.get("env_turn_plan", {}),
+        "quality_flags": state.get("quality_flags", {}),
+        "history": state.get("history", {}),
+        "outbox": state.get("outbox", []),
+        "narrations": state.get("narrations", []),
+    }, author="user")
+
+    await flush_adk_outbox()
+    print("[ROLEARENA] Turn complete")
+
+
 async def run_adk_turn(new_message_text: str):
     """Run a full ADK turn based on a new message.
 
     Before each turn, we create a new root agent with shuffled persona agent order.
     This ensures each agent sees state updates in a different order each turn,
     making their responses more varied and natural.
+
+    If ROLEARENA_MODE is enabled, uses RoleArena turn processing instead.
     """
+    # Route to RoleArena if mode is enabled
+    if ROLEARENA_MODE:
+        await run_rolearena_turn(new_message_text)
+        return
     # Note: we create the per-turn root agent AFTER we compute milestone state,
     # so we can optionally extend the pipeline with the webtoon storyline loop.
     # If Episode 1 is already marked complete (12-scene deterministic mode), stop the sim here.
@@ -1168,6 +1574,204 @@ async def reset_storyline():
             author="user"
         )
     return {"status": "ok", "message": "Storyline trigger flag reset"}
+
+
+# ========== RoleArena API Endpoints ==========
+
+@app.get("/api/rolearena/status")
+async def get_rolearena_status():
+    """Get RoleArena mode status and current state."""
+    global ROLEARENA_MODE
+
+    result = {
+        "enabled": ROLEARENA_MODE,
+        "mode": "rolearena" if ROLEARENA_MODE else "legacy"
+    }
+
+    if ROLEARENA_MODE:
+        try:
+            session = await session_service.get_session(
+                app_name="QueerSim",
+                user_id=GLOBAL_USER_ID,
+                session_id=GLOBAL_SESSION_ID
+            )
+
+            if session and session.state:
+                state = session.state
+                plot = state.get("plot", {})
+
+                # Safely get current node
+                current_node = None
+                try:
+                    current_node = get_current_node(state)
+                except Exception as e:
+                    print(f"[SERVER] Could not get current node: {e}")
+
+                result["plot_state"] = {
+                    "node_idx": plot.get("node_idx", 0),
+                    "node_turns": plot.get("node_turns", 0),
+                    "total_turns": plot.get("total_turns", 0),
+                    "current_beat": current_node.get("beat") if current_node else None,
+                    "total_nodes": len(plot.get("nodes", [])),
+                    "director_controls": state.get("director", {}).get("controls", {}),
+                    "quality_flags": state.get("quality_flags", {})
+                }
+            else:
+                result["plot_state"] = {
+                    "error": "Session or state not found",
+                    "node_idx": 0,
+                    "node_turns": 0,
+                    "total_turns": 0,
+                    "current_beat": None,
+                    "total_nodes": 0,
+                    "director_controls": {},
+                    "quality_flags": {}
+                }
+        except Exception as e:
+            print(f"[SERVER] Error getting RoleArena status: {e}")
+            import traceback
+            traceback.print_exc()
+            result["plot_state"] = {
+                "error": str(e),
+                "node_idx": 0,
+                "node_turns": 0,
+                "total_turns": 0,
+                "current_beat": None,
+                "total_nodes": 0,
+                "director_controls": {},
+                "quality_flags": {}
+            }
+
+    return result
+
+
+@app.post("/api/rolearena/toggle")
+async def toggle_rolearena_mode(data: dict):
+    """Toggle RoleArena mode on/off. Requires session reset."""
+    global ROLEARENA_MODE
+
+    try:
+        enabled = data.get("enabled", False)
+        ROLEARENA_MODE = bool(enabled)
+
+        print(f"[SERVER] RoleArena mode {'ENABLED' if ROLEARENA_MODE else 'DISABLED'}")
+
+        # Reinitialize session with appropriate state
+        new_state = _get_initial_session_state()
+        print(f"[SERVER] Created new state: mode={'rolearena' if ROLEARENA_MODE else 'legacy'}")
+
+        # Delete old session (if exists)
+        try:
+            await session_service.delete_session(
+                app_name="QueerSim",
+                user_id=GLOBAL_USER_ID,
+                session_id=GLOBAL_SESSION_ID
+            )
+            print("[SERVER] Deleted old session")
+        except Exception as e:
+            print(f"[SERVER] Note: Could not delete old session (may not exist): {e}")
+
+        # Create new session
+        session_service.create_session_sync(
+            app_name="QueerSim",
+            user_id=GLOBAL_USER_ID,
+            session_id=GLOBAL_SESSION_ID,
+            state=new_state
+        )
+        print("[SERVER] Created new session")
+
+        # Seed initial chat (only if not RoleArena mode, or handle RoleArena differently)
+        if not ROLEARENA_MODE:
+            await seed_initial_chat()
+        else:
+            # For RoleArena, add a simple welcome message
+            from adk_sim.state import add_message
+            session = await session_service.get_session(
+                app_name="QueerSim",
+                user_id=GLOBAL_USER_ID,
+                session_id=GLOBAL_SESSION_ID
+            )
+            if session:
+                state = session.state
+                add_message(state, "group_chat", "System",
+                    "RoleArena mode enabled. You are the director - guide the story through discrete plot nodes.")
+                await apply_state_delta({
+                    "history": state.get("history", {}),
+                    "outbox": state.get("outbox", [])
+                }, author="system")
+                await flush_adk_outbox()
+            print("[SERVER] Seeded RoleArena welcome message")
+
+        return {
+            "status": "ok",
+            "enabled": ROLEARENA_MODE,
+            "mode": "rolearena" if ROLEARENA_MODE else "legacy",
+            "message": f"Switched to {'RoleArena' if ROLEARENA_MODE else 'Legacy'} mode. Session reset."
+        }
+    except Exception as e:
+        print(f"[SERVER] Error toggling RoleArena mode: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "status": "error",
+            "error": str(e),
+            "enabled": ROLEARENA_MODE,
+            "mode": "rolearena" if ROLEARENA_MODE else "legacy"
+        }
+
+
+@app.post("/api/rolearena/controls")
+async def update_rolearena_controls(data: dict):
+    """Update RoleArena director controls (pace, spice, angst, comedy)."""
+    if not ROLEARENA_MODE:
+        return {"error": "RoleArena mode not enabled"}, 400
+
+    controls = data.get("controls", {})
+    valid_controls = {}
+
+    # Validate and sanitize controls
+    if "pace" in controls and controls["pace"] in ["slow", "med", "fast"]:
+        valid_controls["pace"] = controls["pace"]
+    if "spice" in controls and 0 <= controls["spice"] <= 3:
+        valid_controls["spice"] = int(controls["spice"])
+    if "angst" in controls and 0 <= controls["angst"] <= 3:
+        valid_controls["angst"] = int(controls["angst"])
+    if "comedy" in controls and 0 <= controls["comedy"] <= 2:
+        valid_controls["comedy"] = int(controls["comedy"])
+
+    if not valid_controls:
+        return {"error": "No valid controls provided"}, 400
+
+    session = await session_service.get_session(
+        app_name="QueerSim",
+        user_id=GLOBAL_USER_ID,
+        session_id=GLOBAL_SESSION_ID
+    )
+
+    if session and session.state:
+        state = session.state
+        current_controls = state.get("director", {}).get("controls", {})
+        current_controls.update(valid_controls)
+
+        from adk_sim.rolearena_state import update_director_intent
+        update_director_intent(
+            state,
+            state.get("director", {}).get("latest_goal", ""),
+            state.get("director", {}).get("constraints", []),
+            current_controls
+        )
+
+        await apply_state_delta({
+            "director": state.get("director", {})
+        }, author="user")
+
+        print(f"[ROLEARENA] Director controls updated: {valid_controls}")
+
+    return {
+        "status": "ok",
+        "controls": valid_controls,
+        "message": "Director controls updated"
+    }
 
 @app.get("/api/storylines")
 async def list_storylines():
