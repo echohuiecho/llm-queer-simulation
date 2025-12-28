@@ -361,6 +361,34 @@ async def run_adk_turn(new_message_text: str):
     """
     # Note: we create the per-turn root agent AFTER we compute milestone state,
     # so we can optionally extend the pipeline with the webtoon storyline loop.
+    # If Episode 1 is already marked complete (12-scene deterministic mode), stop the sim here.
+    # This prevents continuing to discuss Episode 2 after persistence is complete.
+    try:
+        session_gate = await session_service.get_session(
+            app_name="QueerSim",
+            user_id=GLOBAL_USER_ID,
+            session_id=GLOBAL_SESSION_ID,
+        )
+        if session_gate and isinstance(session_gate.state, dict) and session_gate.state.get("storyline_done") is True:
+            from adk_sim.state import add_message
+            state_gate = session_gate.state
+            if not state_gate.get("storyline_done_announced"):
+                add_message(
+                    state_gate,
+                    "group_chat",
+                    "System",
+                    "Episode 1 is complete (12 scenes). Story generation finished; no further episodes will be discussed in this run.",
+                )
+                state_gate["storyline_done_announced"] = True
+                await apply_state_delta(
+                    {"history": state_gate.get("history", {}), "outbox": state_gate.get("outbox", []), "storyline_done_announced": True},
+                    author="system",
+                )
+                await flush_adk_outbox()
+            return
+    except Exception:
+        # If gating fails, continue; we prefer not to block chat due to gating errors.
+        pass
 
     async def run_scripted_fallback(note: str | None = None):
         """Context-aware fallback so the sim still works if Gemini/ADK fails."""

@@ -2,11 +2,138 @@ import time
 import random
 import json
 from typing import Any, Dict, List, Optional
+import re
 from google.adk.tools.tool_context import ToolContext
 from .state import add_message, add_dm, update_agent_pos, add_to_outbox
 from .persistence import get_storyline_persistence
 from .validation import validate_storyline_state
 from config import config
+
+
+def _has_cjk(text: str) -> bool:
+    try:
+        return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
+    except Exception:
+        return False
+
+
+def _default_panels_for_scene(scene_summary: str) -> List[Dict[str, Any]]:
+    """Generate deterministic, minimal non-empty panels for a scene when missing.
+
+    Goal: never persist summary-only scenes; always have 3-6 panels with non-empty dialogue + visual_description.
+    """
+    summary = (scene_summary or "").strip()
+    cjk = _has_cjk(summary)
+    if not summary:
+        summary = "場景推進。" if cjk else "Story beat."
+
+    if cjk:
+        return [
+            {
+                "panel_number": 1,
+                "visual_description": f"建立場景（遠景）：{summary}",
+                "dialogue": f"（敘述）{summary}",
+                "mood": "鋪陳",
+            },
+            {
+                "panel_number": 2,
+                "visual_description": f"角色互動（中景）：{summary}",
+                "dialogue": "（敘述）情緒與關係往前推進。",
+                "mood": "推進",
+            },
+            {
+                "panel_number": 3,
+                "visual_description": f"收束鉤子（近景）：{summary}",
+                "dialogue": "（敘述）留下下一幕的懸念。",
+                "mood": "懸念",
+            },
+        ]
+
+    return [
+        {
+            "panel_number": 1,
+            "visual_description": f"Establishing shot: {summary}",
+            "dialogue": f"(Narration) {summary}",
+            "mood": "setup",
+        },
+        {
+            "panel_number": 2,
+            "visual_description": f"Action beat: {summary}",
+            "dialogue": "(Narration) The relationship shifts forward.",
+            "mood": "progress",
+        },
+        {
+            "panel_number": 3,
+            "visual_description": f"Hook beat: {summary}",
+            "dialogue": "(Narration) A hook tees up the next scene.",
+            "mood": "hook",
+        },
+    ]
+
+
+def _repair_scene_panels_inplace(scene: Dict[str, Any]) -> None:
+    """Ensure scene.panels exists; ensure each panel has non-empty dialogue + visual_description.
+    Also enforces 3–6 panels.
+    """
+    summary = str(scene.get("summary") or "")
+    cjk = _has_cjk(summary)
+
+    panels = scene.get("panels")
+    if not isinstance(panels, list) or not panels:
+        scene["panels"] = _default_panels_for_scene(summary)
+        return
+
+    repaired: List[Dict[str, Any]] = []
+    for idx, p in enumerate(panels, start=1):
+        if not isinstance(p, dict):
+            continue
+        vd = str(p.get("visual_description") or "").strip()
+        dlg = str(p.get("dialogue") or "").strip()
+        mood = str(p.get("mood") or "").strip()
+        if not vd:
+            vd = (f"（敘述）{summary}（補齊畫面描述）" if cjk else f"(Narration) {summary} (filled visual)")
+        if not dlg:
+            dlg = (f"（敘述）{summary}" if cjk else f"(Narration) {summary}")
+        if not mood:
+            mood = ("推進" if cjk else "progress")
+        repaired.append(
+            {
+                "panel_number": idx,
+                "visual_description": vd,
+                "dialogue": dlg,
+                "mood": mood,
+            }
+        )
+
+    if len(repaired) < 3:
+        pad = _default_panels_for_scene(summary)[-(3 - len(repaired)) :]
+        start = len(repaired) + 1
+        for i, pp in enumerate(pad):
+            pp["panel_number"] = start + i
+        repaired.extend(pad)
+    if len(repaired) > 6:
+        repaired = repaired[:6]
+
+    # Renumber 1..N
+    for idx, pp in enumerate(repaired, start=1):
+        pp["panel_number"] = idx
+
+    scene["panels"] = repaired
+
+
+def _repair_episode_inplace(storyline: Dict[str, Any], episode_number: int) -> None:
+    scenes = storyline.get("scenes")
+    if not isinstance(scenes, list):
+        return
+    for s in scenes:
+        if not isinstance(s, dict):
+            continue
+        try:
+            ep = int(s.get("episode") or 0)
+        except Exception:
+            ep = 0
+        if ep == int(episode_number):
+            _repair_scene_panels_inplace(s)
 
 # We'll need access to the RAG index.
 # Since tools are just functions, we can set this from server.py during startup.
@@ -110,6 +237,11 @@ def plan_storyline(
         if isinstance(scene, dict):
             if "episode" not in scene or scene.get("episode") == 0:
                 scene["episode"] = 1  # Default to episode 1
+
+    # NEW: Ensure every scene has 3-6 panels with non-empty dialogue/visual_description.
+    # This fixes "scene 1-3 summary-only" and "scene 4 empty panel fields".
+    if isinstance(parsed.get("scenes"), list):
+        _repair_episode_inplace(parsed, 1)
 
     version = int(state.get("storyline_version") or 0) + 1
     parsed.setdefault("meta", {})
@@ -557,14 +689,21 @@ def add_scene_to_episode(
         normalized_panels.append(
             {
                 "panel_number": int(p.get("panel_number") or next_panel_num),
-                "visual_description": str(p.get("visual_description") or ""),
-                "dialogue": str(p.get("dialogue") or ""),
-                "mood": str(p.get("mood") or ""),
+                "visual_description": str(p.get("visual_description") or "").strip(),
+                "dialogue": str(p.get("dialogue") or "").strip(),
+                "mood": str(p.get("mood") or "").strip(),
             }
         )
         next_panel_num += 1
     if not normalized_panels:
         return {"result": "fail", "message": "No valid panel objects provided."}
+    # Enforce mandatory content: every panel must have dialogue + visual_description (non-empty).
+    for pp in normalized_panels:
+        if not pp.get("visual_description") or not pp.get("dialogue"):
+            return {
+                "result": "fail",
+                "message": "Each panel must include non-empty visual_description AND dialogue (mandatory).",
+            }
 
     max_scene_num = 0
     for s in scenes:
@@ -584,6 +723,11 @@ def add_scene_to_episode(
         }
     )
 
+    # Repair all scenes in this episode before bumping version/persisting.
+    # This ensures earlier summary-only scenes and empty panel fields are fixed in the final JSON.
+    if isinstance(cur, dict):
+        _repair_episode_inplace(cur, int(episode_number))
+
     version = bump_storyline_version(state)
     emit_storyline_update(state, room=room)
 
@@ -594,6 +738,7 @@ def add_scene_to_episode(
         if new_scene_number >= 12:
             progress_msg += " Episode 1 is now complete!"
             add_message(state, room, "System", progress_msg)
+            # Mark complete and STOP (do not continue into episode 2 discussion).
             process_episode_completion(state, 1, room=room)
             return {"result": "ok", "version": version, "episode": 1, "scene_number": 12, "completed": True}
 
@@ -875,15 +1020,22 @@ def process_episode_completion(state: Dict[str, Any], episode_number: int, room:
     state["episode_completion_proposals"] = {}
     state["episode_completion_votes"] = {}
 
-    # Move to next episode
-    try:
-        next_ep = int(episode_number) + 1
-        state["current_episode_number"] = next_ep
-    except Exception:
-        next_ep = 1
+    # Stop condition: for our deterministic "Episode 1 = 12 scenes" mode, end the run here.
+    # We intentionally do NOT proceed to Episode 2 in chat; user can start a new run for later episodes.
+    if int(episode_number) == 1:
+        state["storyline_done"] = True
         state["current_episode_number"] = 1
-
-    add_message(state, room, "System", f"Episode {episode_number} complete. Starting work on Episode {next_ep}.")
+        add_message(state, room, "System", f"Episode 1 complete. Story generation finished (v{version}).")
+        next_ep = 1
+    else:
+        # Default behavior for other episodes (if enabled in the future)
+        try:
+            next_ep = int(episode_number) + 1
+            state["current_episode_number"] = next_ep
+        except Exception:
+            next_ep = 1
+            state["current_episode_number"] = 1
+        add_message(state, room, "System", f"Episode {episode_number} complete. Starting work on Episode {next_ep}.")
 
     # Update progress tracking
     if "update_types_log" not in state:
