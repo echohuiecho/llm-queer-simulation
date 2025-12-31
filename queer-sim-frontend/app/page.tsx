@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
+import PlotProgression from "../components/PlotProgression";
 
 type RoomId = "apartment" | "cafe" | "group_chat";
 
@@ -442,6 +443,9 @@ export default function Home() {
 
   return (
     <main style={{ height: "100vh", display: "grid", gridTemplateColumns: "1fr 400px", gap: 20, padding: 20, background: "#050505", color: "white", overflow: "hidden" }}>
+      {/* Plot Progression Panel (RoleArena mode) */}
+      <PlotProgression />
+
       {/* Floorplan section */}
       <section style={{ display: "grid", gridTemplateColumns: "1fr 0.8fr", gridTemplateRows: "1fr 1fr", gap: 20 }}>
         <div style={{ gridRow: "1 / 3" }}>

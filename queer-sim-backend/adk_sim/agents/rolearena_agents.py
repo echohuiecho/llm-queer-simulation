@@ -263,6 +263,112 @@ def generate_bridge_narration(
 
 
 # ============================================================================
+# DirectorAgent (AI Director)
+# ============================================================================
+
+def generate_director_message(
+    state: Dict[str, Any],
+    current_node: Dict[str, Any],
+    previous_node: Optional[Dict[str, Any]] = None,
+    storyline_context: str = ""
+) -> str:
+    """
+    Generate a director message based on storyline context and current plot node.
+
+    Args:
+        state: Current RoleArena state
+        current_node: Current plot node
+        previous_node: Previous node (if advancing)
+        storyline_context: Storyline context from config
+
+    Returns:
+        Director message string (1-3 sentences)
+    """
+    logger.info(f"[ROLEARENA_AGENTS] DirectorAgent generating message for node: {current_node['beat']}")
+
+    # Get storyline context from state or config
+    if not storyline_context:
+        storyline_context = config.get("storyline_context_content", "")
+
+    if not storyline_context:
+        # Fallback: use node goal as director message
+        logger.warning("[ROLEARENA_AGENTS] No storyline context, using node goal as fallback")
+        return f"Continue the story: {current_node['goal']}"
+
+    # Use LLM if available
+    if config.get("google_api_key"):
+        try:
+            from google.genai import Client
+            client = Client(api_key=config.get("google_api_key"))
+
+            # Get recent story context
+            history = state.get("history", {}).get("group_chat", [])
+            recent_summary = ""
+            if history:
+                recent_messages = history[-5:] if len(history) > 5 else history
+                recent_summary = "\n".join([
+                    f"- {m.get('from', 'Unknown')}: {m.get('text', '')[:100]}"
+                    for m in recent_messages
+                ])
+
+            director_prompt = load_prompt("director_agent.txt")
+
+            prompt = f"""{director_prompt}
+
+Storyline Context:
+{storyline_context}
+
+Current Plot Node:
+- Beat: {current_node['beat']}
+- Goal: {current_node['goal']}
+- Exit conditions: {', '.join(current_node.get('exit_conditions', []))}
+- Stakes: {current_node.get('stakes', '')}
+
+{f"Previous Node: {previous_node['beat']} - {previous_node['goal']}" if previous_node else "This is the first node."}
+
+Recent Story Development:
+{recent_summary if recent_summary else "Story just started."}
+
+Generate a director message now:"""
+
+            response = client.models.generate_content(
+                model="gemini-2.0-flash-exp",
+                contents=prompt
+            )
+
+            logger.info(f"[ROLEARENA_AGENTS] Gemini response received: {len(response.text)} chars")
+
+            director_message = response.text.strip()
+            # Remove quotes if present
+            if director_message.startswith('"') and director_message.endswith('"'):
+                director_message = director_message[1:-1]
+            if director_message.startswith("'") and director_message.endswith("'"):
+                director_message = director_message[1:-1]
+
+            logger.info(f"[ROLEARENA_AGENTS]   Director message: {director_message[:100]}...")
+            return director_message
+
+        except Exception as e:
+            logger.warning(f"[ROLEARENA_AGENTS] DirectorAgent LLM failed: {e}, using fallback")
+            import traceback
+            traceback.print_exc()
+
+    # Fallback: generate from node goal and storyline context
+    logger.info("[ROLEARENA_AGENTS] Using fallback director message generation")
+
+    # Extract key elements from storyline context
+    context_snippet = storyline_context[:200] if len(storyline_context) > 200 else storyline_context
+
+    # Generate simple director message
+    if previous_node:
+        director_message = f"Continue the story. {current_node['goal']} Based on: {context_snippet[:100]}..."
+    else:
+        director_message = f"Let's start the story. {context_snippet[:150]}... Focus on: {current_node['goal']}"
+
+    return director_message
+
+
+# ============================================================================
 # Quality Monitoring (lightweight)
 # ============================================================================
 
@@ -311,6 +417,7 @@ __all__ = [
     "create_critic_gate",
     "should_advance_node",
     "generate_bridge_narration",
+    "generate_director_message",
     "compute_quality_flags",
 ]
 

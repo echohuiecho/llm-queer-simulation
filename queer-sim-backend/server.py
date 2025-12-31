@@ -96,8 +96,44 @@ def _get_initial_session_state():
     """Get initial state based on current mode."""
     if ROLEARENA_MODE:
         print("[SERVER] Initializing RoleArena mode state")
+
+        # Get storyline context from config (set via settings page)
+        storyline_context = config.get("storyline_context_content", "")
+        storyline_dir = config.get("storyline_context_dir", "")
+
+        # Generate initial director message from AI Director if storyline context exists
+        if storyline_context and storyline_context.strip():
+            print(f"[SERVER] Using storyline context from: {storyline_dir}")
+            try:
+                from adk_sim.agents.rolearena_agents import generate_director_message
+                # get_current_node is already imported at top of file
+
+                # Create temporary state to get first node
+                temp_state = init_rolearena_story_state(
+                    director_first_message="temp",
+                    controls={"pace": "slow", "spice": 1, "angst": 2, "comedy": 1},
+                    num_nodes=9
+                )
+                # get_current_node is already imported at top of file
+                first_node = get_current_node(temp_state)
+
+                # Generate AI director message
+                director_message = generate_director_message(
+                    temp_state,
+                    first_node,
+                    previous_node=None,
+                    storyline_context=storyline_context
+                )
+                print(f"[SERVER] AI Director generated initial message: {director_message[:100]}...")
+            except Exception as e:
+                print(f"[SERVER] AI Director failed, using fallback: {e}")
+                director_message = f"Let's start the story: {storyline_context[:150]}..."
+        else:
+            director_message = "Welcome to RoleArena mode! Let's create a Girls' Love story."
+            print("[SERVER] No storyline context, using default director message")
+
         state = init_rolearena_story_state(
-            director_first_message="Welcome to RoleArena mode! Let's create a Girls' Love story.",
+            director_first_message=director_message,
             controls={"pace": "slow", "spice": 1, "angst": 2, "comedy": 1},
             num_nodes=9
         )
@@ -419,7 +455,7 @@ async def run_rolearena_turn(new_message_text: str):
     7. Increment turn counters
     8. Update quality flags
     """
-    print("[ROLEARENA] Starting RoleArena turn")
+    print(f"[ROLEARENA] Starting RoleArena turn with message: {new_message_text[:100] if new_message_text else 'None'}...")
 
     session = await session_service.get_session(
         app_name="QueerSim",
@@ -428,22 +464,88 @@ async def run_rolearena_turn(new_message_text: str):
     )
 
     if not session:
-        print("[ROLEARENA] No session found")
+        print("[ROLEARENA] ERROR: No session found - cannot proceed")
+        return
+
+    if not session.state:
+        print("[ROLEARENA] ERROR: Session has no state - cannot proceed")
         return
 
     state = session.state
+    print(f"[ROLEARENA] Session state loaded. ROLEARENA_MODE={ROLEARENA_MODE}")
 
-    # Step 1: Extract director intent (simplified - could use LLM)
-    print(f"[ROLEARENA] Director message: {new_message_text[:100]}...")
+    # Step 1: Extract director intent and preserve it
+    director_state = state.get("director", {})
+    director_latest_goal = director_state.get("latest_goal", "")
+    director_constraints = director_state.get("constraints", [])
+
+    # Check if this is a user message (not from proactive loop or AI Director)
+    is_user_message = new_message_text and new_message_text.strip() and new_message_text != "nothing happened, what do you do?"
+
+    if is_user_message:
+        # User sent a manual director message - use it and update state
+        from adk_sim.rolearena_state import update_director_intent
+        update_director_intent(
+            state,
+            new_message_text.strip(),
+            director_constraints,
+            director_state.get("controls", {})
+        )
+        director_latest_goal = new_message_text.strip()
+        print(f"[ROLEARENA] User director message: {director_latest_goal[:100]}...")
+    else:
+        # Use stored director goal (from AI Director or previous user message)
+        if director_latest_goal:
+            print(f"[ROLEARENA] Using stored director goal: {director_latest_goal[:100]}...")
+        else:
+            # No director goal yet - generate one from AI Director if storyline context exists
+            storyline_context = config.get("storyline_context_content", "")
+            if storyline_context:
+                try:
+                    from adk_sim.agents.rolearena_agents import generate_director_message
+                    # get_current_node is already imported at top of file
+                    current_node = get_current_node(state)
+                    if current_node:
+                        print("[ROLEARENA] Generating initial AI Director message...")
+                        director_message = generate_director_message(
+                            state,
+                            current_node,
+                            previous_node=None,
+                            storyline_context=storyline_context
+                        )
+                        from adk_sim.rolearena_state import update_director_intent
+                        update_director_intent(
+                            state,
+                            director_message,
+                            director_constraints,
+                            director_state.get("controls", {})
+                        )
+                        director_latest_goal = director_message
+                        print(f"[ROLEARENA] AI Director generated: {director_latest_goal[:100]}...")
+                except Exception as e:
+                    print(f"[ROLEARENA] AI Director failed: {e}")
+                    director_latest_goal = new_message_text if new_message_text else ""
+            else:
+                print(f"[ROLEARENA] No director goal set, using message: {new_message_text[:100] if new_message_text else 'none'}...")
+                director_latest_goal = new_message_text if new_message_text else ""
 
     # Step 2: EnvAgent generates turn plan
-    current_node = get_current_node(state)
-    if not current_node:
-        print("[ROLEARENA] No current node, cannot proceed")
+    plot = state.get("plot", {})
+    if not plot:
+        print("[ROLEARENA] ERROR: No plot structure in state")
         return
 
-    print(f"[ROLEARENA] Current node: {current_node['beat']}")
-    plot = state.get("plot", {})
+    nodes = plot.get("nodes", [])
+    if not nodes:
+        print("[ROLEARENA] ERROR: No plot nodes in state")
+        return
+
+    current_node = get_current_node(state)
+    if not current_node:
+        print(f"[ROLEARENA] ERROR: No current node found. node_idx={plot.get('node_idx', 'N/A')}, total_nodes={len(nodes)}")
+        return
+
+    print(f"[ROLEARENA] Current node: {current_node.get('beat', 'Unknown')} (idx={plot.get('node_idx', 0)})")
     node_idx = plot.get("node_idx", 0)
     node_turns = plot.get("node_turns", 0)
 
@@ -463,8 +565,10 @@ async def run_rolearena_turn(new_message_text: str):
                     "current_node": current_node,
                     "characters": state.get("characters", {}),
                 },
-                "director_message": new_message_text,
-                "director_controls": state.get("director", {}).get("controls", {}),
+                "director_message": new_message_text if new_message_text != "nothing happened, what do you do?" else "",
+                "director_goal": director_latest_goal,  # Always include stored goal
+                "director_controls": director_state.get("controls", {}),
+                "director_constraints": director_constraints,
                 "recent_dialogue": [{"from": m.get("from", ""), "text": m.get("text", "")} for m in recent_history],
             }
 
@@ -476,23 +580,41 @@ async def run_rolearena_turn(new_message_text: str):
             api_key = config.get("google_api_key")
             client = Client(api_key=api_key)
 
-            env_prompt = f"""Current story state:
-- Node: {current_node['beat']} (turn {node_turns})
-- Goal: {current_node['goal']}
-- Director message: {new_message_text}
-- Controls: {state.get('director', {}).get('controls', {})}
+            # Build comprehensive director context
+            director_context = f"""Director's overall goal: {director_latest_goal}"""
+            if director_constraints:
+                director_context += f"\nDirector constraints: {', '.join(director_constraints)}"
+            if new_message_text and new_message_text != "nothing happened, what do you do?":
+                director_context += f"\nDirector's current message: {new_message_text}"
 
-Recent dialogue:
-{chr(10).join([f"- {m['from']}: {m['text'][:100]}" for m in recent_history[-3:]])}
+            env_prompt = f"""You are EnvAgent (Environment/Showrunner) for a live GL story.
+The user is an out-of-world director. Their goal and constraints guide the entire story.
+
+{director_context}
+
+Current plot node:
+- Beat: {current_node['beat']} (turn {node_turns} of this node)
+- Node goal: {current_node['goal']}
+- Exit conditions: {', '.join(current_node.get('exit_conditions', []))}
+
+Recent dialogue (last 3 messages):
+{chr(10).join([f"- {m['from']}: {m['text'][:150]}" for m in recent_history[-3:]])}
+
+CRITICAL: Your narration must stay aligned with the director's goal: "{director_latest_goal}"
+- If the director specified characters, settings, or situations, maintain those throughout
+- Don't drift away from the director's vision
+- Build on what the director established, don't replace it
 
 Generate a turn plan as JSON:
-- narration: 1-3 sentence scene narration
-- beat_focus: what must progress in this node
+- narration: 1-3 sentence scene narration that maintains director's vision
+- beat_focus: what must progress in this node (aligned with director goal)
 - next_speaker: choose from [a1, a2, a3]
-- micro_objectives: {{a1: str, a2: str, a3: str}}
+- micro_objectives: {{a1: str, a2: str, a3: str}} (specific, actionable)
 - style_rules: list of 3-5 rules
 - advance_candidate: boolean (should we check for node advance?)
 - advance_reason: string (why/why not)
+
+Return ONLY valid JSON, no markdown formatting.
 """
 
             response = client.models.generate_content(
@@ -726,6 +848,40 @@ Decision guidelines:
 
                 add_message(state, "group_chat", "Narrator", bridge)
                 print(f"[ROLEARENA] Advanced to node {node_idx + 1}: {next_node['beat']}")
+
+                # Step 6.5: Generate AI Director message for new node
+                try:
+                    from adk_sim.agents.rolearena_agents import generate_director_message
+                    storyline_context = config.get("storyline_context_content", "")
+
+                    if storyline_context:
+                        print("[ROLEARENA] AI Director generating message for new node...")
+                        director_message = generate_director_message(
+                            state,
+                            next_node,
+                            previous_node=current,
+                            storyline_context=storyline_context
+                        )
+
+                        # Update director goal in state
+                        from adk_sim.rolearena_state import update_director_intent
+                        director_state = state.get("director", {})
+                        update_director_intent(
+                            state,
+                            director_message,
+                            director_state.get("constraints", []),
+                            director_state.get("controls", {})
+                        )
+
+                        # Add director message to chat
+                        add_message(state, "group_chat", "Director", director_message)
+                        print(f"[ROLEARENA] AI Director: {director_message[:100]}...")
+                    else:
+                        print("[ROLEARENA] No storyline context, skipping AI Director message")
+                except Exception as e:
+                    print(f"[ROLEARENA] AI Director failed: {e}")
+                    import traceback
+                    traceback.print_exc()
         else:
             print("[ROLEARENA] Critic rejected advancement, continuing current node")
 
@@ -1234,13 +1390,30 @@ async def proactive_loop():
     while True:
         await asyncio.sleep(random.uniform(20, 60))
 
-        # 50% chance to just move agents slightly in state before turn
         session = await session_service.get_session(
             app_name="QueerSim",
             user_id=GLOBAL_USER_ID,
             session_id=GLOBAL_SESSION_ID,
         )
 
+        if not session:
+            continue
+
+        # In RoleArena mode, use director's goal instead of generic message
+        if ROLEARENA_MODE:
+            state = session.state
+            director_state = state.get("director", {})
+            director_goal = director_state.get("latest_goal", "")
+
+            # Only trigger if there's a director goal
+            if director_goal and director_goal.strip():
+                print(f"[PROACTIVE] RoleArena: Triggering turn with director goal: {director_goal[:50]}...")
+                await run_adk_turn(director_goal)
+            else:
+                print("[PROACTIVE] RoleArena: No director goal set, skipping turn")
+            continue
+
+        # Legacy mode: 50% chance to just move agents slightly in state before turn
         if random.random() < 0.5:
             state = session.state
             agents = state.get("agents", [])
@@ -1607,13 +1780,51 @@ async def get_rolearena_status():
                 except Exception as e:
                     print(f"[SERVER] Could not get current node: {e}")
 
+                nodes = plot.get("nodes", [])
+                node_idx = plot.get("node_idx", 0)
+                node_turns = plot.get("node_turns", 0)
+                node_budget = plot.get("node_budget", {})
+
+                # Calculate progress percentage
+                total_nodes = len(nodes)
+                overall_progress = (node_idx / total_nodes * 100) if total_nodes > 0 else 0
+
+                # Calculate node progress (turns vs target)
+                target_turns = node_budget.get("target", 5)
+                node_progress = min(100, (node_turns / target_turns * 100)) if target_turns > 0 else 0
+
+                # Get all nodes for visualization
+                all_nodes = []
+                for i, node in enumerate(nodes):
+                    all_nodes.append({
+                        "id": node.get("id", i),
+                        "beat": node.get("beat", ""),
+                        "goal": node.get("goal", ""),
+                        "stakes": node.get("stakes", ""),
+                        "completed": i < node_idx,
+                        "current": i == node_idx,
+                        "upcoming": i > node_idx
+                    })
+
                 result["plot_state"] = {
-                    "node_idx": plot.get("node_idx", 0),
-                    "node_turns": plot.get("node_turns", 0),
+                    "node_idx": node_idx,
+                    "node_turns": node_turns,
                     "total_turns": plot.get("total_turns", 0),
                     "current_beat": current_node.get("beat") if current_node else None,
-                    "total_nodes": len(plot.get("nodes", [])),
+                    "current_goal": current_node.get("goal") if current_node else None,
+                    "current_stakes": current_node.get("stakes") if current_node else None,
+                    "exit_conditions": current_node.get("exit_conditions", []) if current_node else [],
+                    "total_nodes": total_nodes,
+                    "overall_progress": round(overall_progress, 1),
+                    "node_progress": round(node_progress, 1),
+                    "node_budget": {
+                        "min": node_budget.get("min", 3),
+                        "target": node_budget.get("target", 5),
+                        "hard_cap": node_budget.get("hard_cap", 7)
+                    },
+                    "all_nodes": all_nodes,
                     "director_controls": state.get("director", {}).get("controls", {}),
+                    "director_goal": state.get("director", {}).get("latest_goal", ""),
                     "quality_flags": state.get("quality_flags", {})
                 }
             else:
@@ -1684,8 +1895,11 @@ async def toggle_rolearena_mode(data: dict):
         if not ROLEARENA_MODE:
             await seed_initial_chat()
         else:
-            # For RoleArena, add a simple welcome message
+            # For RoleArena, use AI Director to generate initial message from storyline context
             from adk_sim.state import add_message
+            # get_current_node is already imported at top of file
+            from adk_sim.agents.rolearena_agents import generate_director_message
+
             session = await session_service.get_session(
                 app_name="QueerSim",
                 user_id=GLOBAL_USER_ID,
@@ -1693,14 +1907,92 @@ async def toggle_rolearena_mode(data: dict):
             )
             if session:
                 state = session.state
-                add_message(state, "group_chat", "System",
-                    "RoleArena mode enabled. You are the director - guide the story through discrete plot nodes.")
-                await apply_state_delta({
-                    "history": state.get("history", {}),
-                    "outbox": state.get("outbox", [])
-                }, author="system")
-                await flush_adk_outbox()
-            print("[SERVER] Seeded RoleArena welcome message")
+
+                # Get storyline context
+                storyline_context = config.get("storyline_context_content", "")
+
+                # Get current node (should be first node at initialization)
+                current_node = get_current_node(state)
+
+                if current_node and storyline_context:
+                    try:
+                        print("[SERVER] AI Director generating initial message from storyline context...")
+                        # Generate AI Director message using Gemini
+                        director_message = generate_director_message(
+                            state,
+                            current_node,
+                            previous_node=None,
+                            storyline_context=storyline_context
+                        )
+
+                        # Update director goal in state BEFORE adding message
+                        from adk_sim.rolearena_state import update_director_intent
+                        director_state = state.get("director", {})
+                        update_director_intent(
+                            state,
+                            director_message,
+                            director_state.get("constraints", []),
+                            director_state.get("controls", {})
+                        )
+                        print(f"[SERVER] Director goal updated in state: {director_message[:50]}...")
+
+                        # Add as Director message (not System)
+                        add_message(state, "group_chat", "Director", director_message)
+                        print(f"[SERVER] AI Director message: {director_message[:100]}...")
+
+                        # Save state with director message
+                        await apply_state_delta({
+                            "history": state.get("history", {}),
+                            "outbox": state.get("outbox", []),
+                            "director": state.get("director", {})
+                        }, author="system")
+                        await flush_adk_outbox()
+
+                        # Trigger first RoleArena turn to get character responses
+                        print("[SERVER] Triggering first RoleArena turn after director message...")
+                        try:
+                            print(f"[SERVER] Calling run_rolearena_turn with: {director_message[:50]}...")
+                            await run_rolearena_turn(director_message)
+                            print("[SERVER] RoleArena turn completed successfully")
+                        except Exception as turn_error:
+                            print(f"[SERVER] ERROR in run_rolearena_turn: {turn_error}")
+                            import traceback
+                            traceback.print_exc()
+                            raise  # Re-raise to be caught by outer try/except
+                    except Exception as e:
+                        print(f"[SERVER] AI Director failed: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        # Fallback to storyline context snippet
+                        fallback_msg = f"Let's start the story: {storyline_context[:200]}..."
+                        add_message(state, "group_chat", "Director", fallback_msg)
+
+                        await apply_state_delta({
+                            "history": state.get("history", {}),
+                            "outbox": state.get("outbox", [])
+                        }, author="system")
+                        await flush_adk_outbox()
+
+                        # Trigger turn with fallback message
+                        await run_rolearena_turn(fallback_msg)
+                else:
+                    # No storyline context or node - use generic message
+                    if not storyline_context:
+                        print("[SERVER] No storyline context, using generic message")
+                    if not current_node:
+                        print("[SERVER] No current node found")
+                    generic_msg = "Welcome to RoleArena mode! Let's create a Girls' Love story."
+                    add_message(state, "group_chat", "Director", generic_msg)
+
+                    await apply_state_delta({
+                        "history": state.get("history", {}),
+                        "outbox": state.get("outbox", [])
+                    }, author="system")
+                    await flush_adk_outbox()
+
+                    # Trigger turn with generic message
+                    await run_rolearena_turn(generic_msg)
+            print("[SERVER] Seeded RoleArena director message and triggered first turn")
 
         return {
             "status": "ok",

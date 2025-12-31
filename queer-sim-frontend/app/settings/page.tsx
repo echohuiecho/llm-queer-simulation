@@ -54,12 +54,49 @@ export default function SettingsPage() {
   const [currentLanguage, setCurrentLanguage] = useState<string>("en");
   const [storylines, setStorylines] = useState<string[]>([]);
   const [selectedStoryline, setSelectedStoryline] = useState<string>("");
+  const [rolearenaEnabled, setRolearenaEnabled] = useState<boolean>(false);
+  const [rolearenaStatus, setRolearenaStatus] = useState<string | null>(null);
 
   useEffect(() => {
     fetchSettings();
     fetchRagDirs();
     fetchStorylines();
+    fetchRolearenaStatus();
   }, []);
+
+  const fetchRolearenaStatus = async () => {
+    try {
+      const response = await fetch("http://localhost:8000/api/rolearena/status");
+      const data = await response.json();
+      setRolearenaEnabled(data.enabled || false);
+    } catch (error) {
+      console.error("Failed to fetch RoleArena status:", error);
+    }
+  };
+
+  const toggleRolearena = async (enabled: boolean) => {
+    setRolearenaStatus("Switching mode...");
+    try {
+      const response = await fetch("http://localhost:8000/api/rolearena/toggle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled }),
+      });
+      const data = await response.json();
+      if (response.ok) {
+        setRolearenaEnabled(data.enabled);
+        setRolearenaStatus(data.message || (enabled ? "RoleArena mode enabled" : "RoleArena mode disabled"));
+        setTimeout(() => setRolearenaStatus(null), 3000);
+      } else {
+        setRolearenaStatus(`Failed: ${data.error || "Unknown error"}`);
+        setTimeout(() => setRolearenaStatus(null), 3000);
+      }
+    } catch (error) {
+      setRolearenaStatus("Error toggling RoleArena mode");
+      setTimeout(() => setRolearenaStatus(null), 3000);
+      console.error("Failed to toggle RoleArena:", error);
+    }
+  };
 
   const fetchStorylines = async () => {
     try {
@@ -595,6 +632,101 @@ export default function SettingsPage() {
               </button>
             </div>
           ))}
+        </section>
+
+        {/* RoleArena Mode Section */}
+        <section style={{ marginBottom: 48 }}>
+          <h2 style={{ fontSize: 20, fontWeight: 600, marginBottom: 20, opacity: 0.8 }}>RoleArena Mode</h2>
+          <div style={{ padding: 24, borderRadius: 16, background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.05)" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 8, color: rolearenaEnabled ? "#4a9eff" : "rgba(255,255,255,0.8)" }}>
+                  {rolearenaEnabled ? "RoleArena Mode: Enabled" : "RoleArena Mode: Disabled"}
+                </div>
+                <div style={{ fontSize: 13, opacity: 0.6, lineHeight: 1.5 }}>
+                  {rolearenaEnabled
+                    ? "Story progresses through discrete plot nodes with AI Director guidance. Plot progression panel visible in main view."
+                    : "Legacy mode: Traditional conversation flow without plot node structure."}
+                </div>
+              </div>
+              <label
+                style={{
+                  position: "relative",
+                  display: "inline-block",
+                  width: 60,
+                  height: 32,
+                  cursor: rolearenaStatus ? "not-allowed" : "pointer",
+                  opacity: rolearenaStatus ? 0.5 : 1,
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={rolearenaEnabled}
+                  onChange={(e) => toggleRolearena(e.target.checked)}
+                  disabled={!!rolearenaStatus}
+                  style={{ opacity: 0, width: 0, height: 0 }}
+                />
+                <span
+                  style={{
+                    position: "absolute",
+                    top: 0,
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    backgroundColor: rolearenaEnabled ? "#4a9eff" : "rgba(255,255,255,0.2)",
+                    borderRadius: 16,
+                    transition: "background-color 0.3s",
+                  }}
+                />
+                <span
+                  style={{
+                    position: "absolute",
+                    top: 4,
+                    left: rolearenaEnabled ? 32 : 4,
+                    width: 24,
+                    height: 24,
+                    backgroundColor: "white",
+                    borderRadius: "50%",
+                    transition: "left 0.3s",
+                    boxShadow: "0 2px 4px rgba(0,0,0,0.2)",
+                  }}
+                />
+              </label>
+            </div>
+            {rolearenaStatus && (
+              <div
+                style={{
+                  marginTop: 12,
+                  padding: 12,
+                  borderRadius: 8,
+                  background: rolearenaStatus.includes("Failed") || rolearenaStatus.includes("Error")
+                    ? "rgba(255, 74, 74, 0.1)"
+                    : "rgba(74, 158, 255, 0.1)",
+                  border: `1px solid ${rolearenaStatus.includes("Failed") || rolearenaStatus.includes("Error") ? "rgba(255, 74, 74, 0.3)" : "rgba(74, 158, 255, 0.3)"}`,
+                  fontSize: 12,
+                  color: rolearenaStatus.includes("Failed") || rolearenaStatus.includes("Error")
+                    ? "#ff4a4a"
+                    : "#4a9eff",
+                }}
+              >
+                {rolearenaStatus}
+              </div>
+            )}
+            {rolearenaEnabled && (
+              <div style={{ marginTop: 16, padding: 16, borderRadius: 8, background: "rgba(74, 158, 255, 0.05)", border: "1px solid rgba(74, 158, 255, 0.2)" }}>
+                <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8, color: "#4a9eff" }}>
+                  RoleArena Features:
+                </div>
+                <ul style={{ margin: 0, paddingLeft: 20, fontSize: 12, opacity: 0.8, lineHeight: 1.6 }}>
+                  <li>Discrete plot nodes (9-node GL arc)</li>
+                  <li>AI Director automatically guides story progression</li>
+                  <li>Turn-level plot advancement detection</li>
+                  <li>Critic gate for pacing control</li>
+                  <li>Real-time plot progression panel</li>
+                </ul>
+              </div>
+            )}
+          </div>
         </section>
 
         {/* Storyline Context Section */}
